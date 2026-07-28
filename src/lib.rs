@@ -14,12 +14,13 @@ pub mod asset_ingest;
 pub mod brush;
 pub mod brush_drag_ops;
 pub mod brush_element_ops;
+pub mod build_panel;
 pub mod build_status;
 pub mod builtin_extensions;
 pub mod clip_ops;
 pub mod command_palette;
-pub mod command_runner;
 pub mod commands;
+pub mod component_json;
 pub mod custom_properties;
 pub mod default_style;
 pub mod draw_brush;
@@ -34,9 +35,11 @@ pub mod hierarchy;
 pub mod history_ops;
 pub mod input_contexts;
 pub mod inspector;
+pub mod jsn_to_bsn;
 pub mod keybind_focus;
 pub mod keybind_settings;
 pub mod keybinds;
+pub mod migrate_dialog;
 
 use std::{collections::BTreeMap, marker::PhantomData};
 
@@ -80,8 +83,10 @@ pub mod pie_projection;
 pub mod prefab;
 pub mod preflight;
 pub mod project;
+pub mod project_build;
 pub mod project_files;
 pub mod project_select;
+pub mod project_types;
 pub mod reference_image;
 pub mod reflect_default;
 pub mod remote;
@@ -93,6 +98,7 @@ pub mod scene_ops;
 pub mod scenes;
 pub mod scrolling_log;
 pub mod sdk_paths;
+pub mod sdk_setup;
 pub mod selection;
 pub mod snapping;
 pub mod status_bar;
@@ -135,7 +141,7 @@ pub mod prelude {
     pub use crate::windowing::{editor_window_plugin, primary_window_attributes};
     pub use crate::{
         DylibLoaderPlugin, EditorCategory, EditorDescription, EditorHidden, EditorPlugins,
-        ExtensionPlugin, SkipSerialization, editor_main,
+        ExtensionPlugin, SkipSerialization,
     };
     pub use jackdaw_api::prelude::*;
 
@@ -184,7 +190,7 @@ pub struct EditorEntity;
 #[derive(Component, Default)]
 pub struct BlocksCameraInput;
 
-// `EditorHidden` is now defined in `crates/jackdaw_jsn/src/editor_meta.rs`
+// `EditorHidden` is now defined in `jackdaw_scene_types`
 // alongside `EditorCategory` / `EditorDescription`. It serves both
 // roles: as a Bevy `Component` for hiding entities from the hierarchy
 // (the original use), and as a `#[reflect(@EditorHidden)]` reflect
@@ -197,11 +203,10 @@ pub struct BlocksCameraInput;
 #[derive(Component, Default)]
 pub struct NonSerializable;
 
-// `SkipSerialization` is defined in `crates/jackdaw_jsn/src/editor_meta.rs`
+// `SkipSerialization` is defined in `jackdaw_scene_types`
 // alongside `EditorHidden` so user game crates that only depend on
-// `jackdaw_runtime` (the static-template default) can reach it
-// without pulling in the full editor crate. Re-exported via
-// `inspector` module + `prelude` below.
+// `jackdaw_runtime` can reach it without pulling in the full editor
+// crate. Re-exported via `inspector` module + `prelude` below.
 
 /// The editor plugin group. Construct with [`EditorPlugins::default`] for the
 /// builder, or add the default instance directly with
@@ -270,76 +275,6 @@ impl PluginGroup for EditorPlugins {
     }
 }
 
-/// One-call entry point for a per-project editor binary. Encapsulates the full
-/// `DefaultPlugins` + ambient-plugin + `EditorPlugins` + auto-open setup so a
-/// project's `src/bin/editor.rs` is a single line:
-///
-/// ```ignore
-/// fn main() -> AppExit {
-///     jackdaw::editor_main(my_game::MyGamePlugin)
-/// }
-/// ```
-///
-/// Pass the game's plugin (or a tuple of plugins) so the editor links the
-/// project's reflected component types into its registry. Without that
-/// reference the linker strips the registrations and the component picker comes
-/// up empty (Bevy's `reflect_auto_register` only sees referenced crates).
-///
-/// The project opens automatically: the launcher hands off via the
-/// `JACKDAW_PROJECT` env var, and `cargo editor` from a project shell falls back
-/// to the current directory. The asset root is the project's `assets/`, and the
-/// `Repeat` image sampler matches how brush materials tile at runtime.
-pub fn editor_main<M>(game: impl bevy::app::Plugins<M>) -> AppExit {
-    use bevy::asset::AssetPlugin;
-    use bevy::image::{ImageAddressMode, ImagePlugin, ImageSamplerDescriptor};
-
-    // Claim SIGINT/SIGTERM before wgpu/gilrs install handlers that swallow it.
-    let _ = ctrlc::set_handler(|| std::process::exit(130));
-
-    let project_root = std::env::var_os("JACKDAW_PROJECT")
-        .map(std::path::PathBuf::from)
-        .or_else(|| std::env::current_dir().ok());
-    let asset_root = project_root
-        .as_ref()
-        .map(|p| p.join("assets").to_string_lossy().to_string())
-        .unwrap_or_else(|| "assets".to_string());
-
-    let mut app = App::new();
-    app.set_error_handler(bevy::ecs::error::error)
-        .add_plugins(
-            DefaultPlugins
-                .set(AssetPlugin {
-                    file_path: asset_root,
-                    ..default()
-                })
-                .set(ImagePlugin {
-                    default_sampler: ImageSamplerDescriptor {
-                        address_mode_u: ImageAddressMode::Repeat,
-                        address_mode_v: ImageAddressMode::Repeat,
-                        address_mode_w: ImageAddressMode::Repeat,
-                        ..ImageSamplerDescriptor::linear()
-                    },
-                })
-                .set(crate::windowing::editor_window_plugin()),
-        )
-        .add_plugins((
-            avian3d::prelude::PhysicsPlugins::default(),
-            bevy_enhanced_input::prelude::EnhancedInputPlugin,
-        ))
-        .add_plugins(EditorPlugins::default())
-        .add_plugins(game);
-
-    if let Some(root) = project_root.filter(|p| p.is_dir()) {
-        // This binary IS the editor; no build step to wait for.
-        app.insert_resource(crate::project_select::PendingAutoOpen {
-            path: root,
-            skip_build: true,
-        });
-    }
-
-    app.run()
-}
-
 /// Plugin required for the Jackdaw's core functionality.
 #[derive(Default)]
 pub struct EditorCorePlugin;
@@ -358,11 +293,13 @@ impl Plugin for EditorCorePlugin {
         }
         app.add_plugins(EditorFeathersPlugin);
         app.add_plugins((
-            jackdaw_jsn::JsnPlugin {
+            jackdaw_scene_types::SceneTypesPlugin {
                 runtime_mesh_rebuild: false,
             },
+            jackdaw_bsn::JackdawBsnPlugin,
             (
                 project_select::ProjectSelectPlugin,
+                sdk_setup::SdkSetupPlugin,
                 scrolling_log::ScrollingLogPlugin,
                 inspector::InspectorPlugin,
                 hierarchy::HierarchyPlugin,
@@ -391,6 +328,7 @@ impl Plugin for EditorCorePlugin {
             viewport_overlays::ViewportOverlaysPlugin,
             view_modes::ViewModesPlugin,
             status_bar::StatusBarPlugin,
+            build_panel::BuildPanelPlugin,
             project_files::ProjectFilesPlugin,
             modal_transform::ModalTransformPlugin,
             numeric_transform::NumericTransformPlugin,
@@ -398,6 +336,7 @@ impl Plugin for EditorCorePlugin {
             brush::BrushPlugin,
             material_preview::MaterialPreviewPlugin,
             undo_snapshot::plugin,
+            migrate_dialog::plugin,
         ))
         .add_plugins((
             material_browser::MaterialBrowserPlugin,
@@ -413,6 +352,7 @@ impl Plugin for EditorCorePlugin {
             jackdaw_widgets::RadialMenuPlugin,
             mesh_quick_menu::MeshQuickMenuPlugin,
             remote::RemoteConnectionPlugin,
+            remote::debug::RemoteDebugPlugin,
         ))
         .add_plugins(jackdaw_avian_integration::PhysicsOverlaysPlugin::<
             selection::Selected,
@@ -473,7 +413,6 @@ impl Plugin for EditorCorePlugin {
         .init_resource::<layout::ActiveDocument>()
         .init_resource::<layout::SceneViewPreset>()
         .init_resource::<asset_catalog::AssetCatalog>()
-        .init_resource::<jackdaw_jsn::SceneJsnAst>()
         .init_resource::<MenuBarDirty>()
         // Always available so the Extensions dialog's runtime
         // "Install from file" path can push into it even when
@@ -591,6 +530,7 @@ impl Plugin for ExtensionPlugin {
                 .register_extension::<builtin_extensions::GamePanelExtension>()
                 .register_extension::<builtin_extensions::TimelineExtension>()
                 .register_extension::<builtin_extensions::TerminalExtension>()
+                .register_extension::<build_panel::BuildPanelExtension>()
                 .register_extension::<builtin_extensions::InspectorExtension>();
         }
 
@@ -815,8 +755,8 @@ fn on_clip_selector_change(
 }
 
 /// Observer: when the inline clip-name `text_edit` commits, route the
-/// rename through `SetJsnField` on the `Name` component so it
-/// participates in undo and round-trips through JSN.
+/// rename through `SetBsnField` on the `Name` component so it
+/// participates in undo and round-trips through the scene document.
 fn on_clip_name_commit(
     event: On<jackdaw_feathers::text_edit::TextEditCommitEvent>,
     name_inputs: Query<&jackdaw_animation::TimelineClipNameInput>,
@@ -1970,10 +1910,10 @@ fn sync_selected_keyframes_from_selection(
 }
 
 /// Observer: when the timeline header's duration field commits,
-/// route the edit through `SetJsnField` so it flows through the AST
-/// and participates in undo/redo + save/load. This is the hand-off
-/// point between the animation crate (which can't import
-/// `SetJsnField`) and the editor binary.
+/// route the edit through `SetBsnField` so it flows through the
+/// document and participates in undo/redo + save/load. This is the
+/// hand-off point between the animation crate (which can't import
+/// `SetBsnField`) and the editor binary.
 fn on_duration_input_commit(
     event: On<jackdaw_feathers::text_edit::TextEditCommitEvent>,
     duration_inputs: Query<&jackdaw_animation::TimelineDurationInput>,
@@ -2010,19 +1950,18 @@ fn on_duration_input_commit(
     if (new_value - clip.duration).abs() < f32::EPSILON {
         return;
     }
-    let old_json = serde_json::json!(clip.duration);
-    let new_json = serde_json::json!(new_value);
+    let old_duration = clip.duration;
     commands.queue(move |world: &mut World| {
         let mut history = world
             .remove_resource::<jackdaw_commands::CommandHistory>()
             .unwrap_or_default();
         history.execute(
-            Box::new(commands::SetJsnField {
+            Box::new(commands::SetBsnField {
                 entity: clip_entity,
                 type_path: "jackdaw_animation::clip::Clip".to_string(),
                 field_path: "duration".to_string(),
-                old_value: old_json,
-                new_value: new_json,
+                old_value: Some(jackdaw_bsn::BsnValue::Float(f64::from(old_duration))),
+                new_value: jackdaw_bsn::BsnValue::Float(f64::from(new_value)),
                 was_derived: false,
             }),
             world,
@@ -2072,12 +2011,12 @@ fn register_animation_entities_in_ast(
 /// semantics.
 ///
 /// Lives in the main crate rather than `jackdaw_animation` because it
-/// needs to read `jackdaw_jsn::GltfSource`, and we'd rather not wire a
+/// needs to read `jackdaw_scene_types::GltfSource`, and we'd rather not wire a
 /// `jackdaw_jsn` dep into the animation crate.
 ///
-/// [`GltfSource`]: jackdaw_jsn::GltfSource
+/// [`GltfSource`]: jackdaw_scene_types::GltfSource
 fn discover_gltf_clips(
-    sources: Query<(Entity, &jackdaw_jsn::GltfSource, Option<&Children>)>,
+    sources: Query<(Entity, &jackdaw_scene_types::GltfSource, Option<&Children>)>,
     existing_refs: Query<(), With<jackdaw_animation::GltfClipRef>>,
     asset_server: Res<AssetServer>,
     gltfs: Res<Assets<bevy::gltf::Gltf>>,
@@ -2166,7 +2105,9 @@ fn populate_menu(
     let mut by_area: std::collections::BTreeMap<String, Vec<(String, String)>> =
         std::collections::BTreeMap::new();
     for descriptor in window_registry.iter() {
-        let area_key = if descriptor.default_area.is_empty() {
+        let area_key = if is_remote_window(&descriptor.id) {
+            "zy_remote".to_string()
+        } else if descriptor.default_area.is_empty() {
             "zz_extensions".to_string()
         } else {
             descriptor.default_area.clone()
@@ -2184,6 +2125,7 @@ fn populate_menu(
         DefaultArea::Center.anchor_id(),
         DefaultArea::BottomDock.anchor_id(),
         DefaultArea::RightSidebar.anchor_id(),
+        "zy_remote".to_string(),
         "zz_extensions".to_string(),
     ];
     let mut first = true;
@@ -2691,12 +2633,60 @@ fn register_workspaces(mut registry: ResMut<jackdaw_panels::WorkspaceRegistry>) 
 
     registry.register(jackdaw_panels::WorkspaceDescriptor {
         id: "debug".into(),
-        name: "Schedule Explorer".into(),
+        name: "Remote Debug".into(),
         icon: Some(String::from(Icon::CalendarSearch.unicode())),
         accent_color: Color::srgba(0.8, 0.55, 0.35, 0.8),
         layout: jackdaw_panels::LayoutState::default(),
-        tree: jackdaw_panels::tree::DockTree::default(),
+        tree: build_debug_tree(),
     });
+}
+
+/// Remote debug workspace: the streamed entity browser on the left, the live
+/// queries panel in the centre, and the remote inspector on the right.
+fn build_debug_tree() -> jackdaw_panels::tree::DockTree {
+    use jackdaw_panels::DockAreaStyle;
+    use jackdaw_panels::tree::{DockLeaf, DockNode, DockSplit, DockTree, SplitAxis};
+
+    let mut tree = DockTree::default();
+
+    let entities = tree.insert(DockNode::Leaf(
+        DockLeaf::new("left", DockAreaStyle::TabBar)
+            .with_windows(vec![
+                "jackdaw.remote.entities".into(),
+                "jackdaw.debug.diagnostics".into(),
+            ])
+            .persistent(),
+    ));
+    let queries = tree.insert(DockNode::Leaf(
+        DockLeaf::new("center", DockAreaStyle::TabBar)
+            .with_windows(vec![
+                "jackdaw.debug.queries".into(),
+                "jackdaw.debug.archetypes".into(),
+                "jackdaw.debug.schedules".into(),
+                "jackdaw.debug.graph".into(),
+                "jackdaw.debug.relationships".into(),
+            ])
+            .persistent(),
+    ));
+    let inspector = tree.insert(DockNode::Leaf(
+        DockLeaf::new("right_sidebar", DockAreaStyle::TabBar)
+            .with_windows(vec!["jackdaw.remote.inspector".into()])
+            .persistent(),
+    ));
+    let center_right = tree.insert(DockNode::Split(DockSplit {
+        axis: SplitAxis::Horizontal,
+        fraction: 0.6,
+        a: queries,
+        b: inspector,
+    }));
+    let root = tree.insert(DockNode::Split(DockSplit {
+        axis: SplitAxis::Horizontal,
+        fraction: 0.3,
+        a: entities,
+        b: center_right,
+    }));
+    tree.root = Some(root);
+    tree
 }
 
 /// Quad-view workspace: one perspective viewport + three orthographic
@@ -2769,6 +2759,7 @@ fn build_level_design_tree() -> jackdaw_panels::tree::DockTree {
         DockLeaf::new("bottom_dock", DockAreaStyle::IconSidebar)
             .with_windows(vec![
                 "jackdaw.assets".into(),
+                "jackdaw.build".into(),
                 "jackdaw.timeline".into(),
                 "jackdaw.terminal".into(),
             ])
@@ -2873,16 +2864,12 @@ fn build_animation_tree() -> jackdaw_panels::tree::DockTree {
 }
 
 fn on_workspace_changed(
-    trigger: On<jackdaw_panels::WorkspaceChanged>,
+    _trigger: On<jackdaw_panels::WorkspaceChanged>,
     mut active: ResMut<layout::ActiveDocument>,
 ) {
-    let event = trigger.event();
-    active.kind = match event.new.as_str() {
-        "debug" => layout::TabKind::ScheduleExplorer,
-        // "layout", "level_design", "animation", and any future
-        // user-created workspace default to the Scene document.
-        _ => layout::TabKind::Scene,
-    };
+    // Every workspace hosts the single Scene document; panels differ only
+    // by their dock tree.
+    active.kind = layout::TabKind::Scene;
 }
 
 #[derive(Resource, Default)]
@@ -2939,7 +2926,7 @@ fn auto_save_layout_on_change(
 fn init_layout(world: &mut World) {
     let layout_json = world
         .get_resource::<crate::project::ProjectRoot>()
-        .and_then(|p| p.config.project.layout.clone());
+        .and_then(|p| p.config.layout.clone());
 
     let mut loaded_tree = false;
     if let Some(json) = layout_json {
@@ -3156,16 +3143,25 @@ fn sync_active_workspace_from_live_tree(world: &mut World) {
 /// runtime split API so the resulting bottom-left leaf gets a
 /// non-persistent synthetic id and collapses naturally back into the
 /// rest of the left sidebar if the user closes it.
+/// True for the debugger's dock windows (remote panels and debug views), which
+/// group together in the Window menu and stay out of the default scene layout.
+fn is_remote_window(id: &str) -> bool {
+    id.starts_with("jackdaw.remote.") || id.starts_with("jackdaw.debug.")
+}
+
 fn build_default_tree(world: &mut World) {
     use jackdaw_panels::tree::{DockLeaf, DockNode, DockSplit, DockTree, Edge, SplitAxis};
     use jackdaw_panels::{DockAreaStyle, WindowRegistry};
 
+    // Remote/debug windows live in the Remote Debug workspace, not the default
+    // scene layout, so keep them out of the canonical tree.
     let windows_for = |area: &str, world: &World| -> Vec<String> {
         world
             .resource::<WindowRegistry>()
             .by_area(area)
             .iter()
             .map(|d| d.id.clone())
+            .filter(|id| !is_remote_window(id))
             .collect()
     };
 

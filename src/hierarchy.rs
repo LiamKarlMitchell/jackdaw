@@ -27,13 +27,13 @@ use jackdaw_widgets::tree_view::{
 
 use crate::{
     EditorEntity, EditorHidden, OP_PREFIX,
-    commands::{CommandHistory, EditorCommand, ReparentEntity, SetJsnField},
+    commands::{CommandHistory, EditorCommand, ReparentEntity, SetBsnField},
     entity_ops,
     layout::HierarchyFilter,
     selection::{Selected, Selection},
 };
 use jackdaw_feathers::dialog::{DialogActionEvent, DialogChildrenSlot};
-use jackdaw_jsn::{Brush, BrushGroup};
+use jackdaw_scene_types::{Brush, BrushGroup};
 
 /// Stores the default name for the prefab save dialog.
 #[derive(Resource, Default)]
@@ -172,7 +172,10 @@ fn classify_entity(world: &World, entity: Entity) -> EntityCategory {
     if world.get::<Mesh3d>(entity).is_some() {
         return EntityCategory::Mesh;
     }
-    if world.get::<jackdaw_jsn::SceneRootTag>(entity).is_some() {
+    if world
+        .get::<jackdaw_scene_types::SceneRootTag>(entity)
+        .is_some()
+    {
         return EntityCategory::Scene;
     }
     if world.get::<WorldAssetRoot>(entity).is_some() {
@@ -256,7 +259,9 @@ fn is_outliner_child(world: &World, child: Entity) -> bool {
     world.get_entity(child).is_ok()
         && world.get::<EditorEntity>(child).is_none()
         && world.get::<EditorHidden>(child).is_none()
-        && world.get::<jackdaw_jsn::DerivedFaceMesh>(child).is_none()
+        && world
+            .get::<jackdaw_scene_types::DerivedFaceMesh>(child)
+            .is_none()
 }
 
 /// Returns true if `entity` has `PrefabEntityId` but NOT `IsA` -- meaning
@@ -1125,7 +1130,6 @@ fn on_tree_row_clicked(
         selection.select_single(&mut commands, event.source_entity);
     }
 
-    // Set keyboard focus to the tree row containing this content
     let content_entity = event.entity;
     if let Ok(&ChildOf(tree_row)) = parent_query.get(content_entity)
         && tree_nodes.contains(tree_row)
@@ -1238,8 +1242,8 @@ fn on_tree_row_dropped(
                 // inside its queued closure (after the framework's
                 // before-snapshot install reshuffles indices).
                 let both_in_ast = {
-                    let ast = world.resource::<jackdaw_jsn::SceneJsnAst>();
-                    ast.key_for_entity(dragged).is_some() && ast.key_for_entity(target).is_some()
+                    let ast = world.resource::<jackdaw_bsn::SceneBsnAst>();
+                    ast.ast_for(dragged).is_some() && ast.ast_for(target).is_some()
                 };
                 if both_in_ast {
                     let _ = world
@@ -1617,8 +1621,8 @@ fn on_context_menu_action(
                 // inside its queued closure (after the framework's
                 // before-snapshot install reshuffles indices).
                 if world
-                    .resource::<jackdaw_jsn::SceneJsnAst>()
-                    .key_for_entity(target)
+                    .resource::<jackdaw_bsn::SceneBsnAst>()
+                    .ast_for(target)
                     .is_none()
                 {
                     return;
@@ -1656,12 +1660,12 @@ fn on_context_menu_action(
                 return;
             };
             commands.queue(move |world: &mut World| {
-                let key = {
-                    let ast = world.resource::<jackdaw_jsn::SceneJsnAst>();
-                    ast.key_for_entity(target)
+                let node = {
+                    let ast = world.resource::<jackdaw_bsn::SceneBsnAst>();
+                    ast.ast_for(target)
                 };
-                let Some(key) = key else { return };
-                crate::prefab::operators::apply_all_overrides_to_source(world, key);
+                let Some(node) = node else { return };
+                crate::prefab::operators::apply_all_overrides_to_source(world, node);
             });
         }
         "hierarchy.prefab.unbundle_instance" => {
@@ -1701,7 +1705,7 @@ fn on_context_menu_action(
 
 /// Spawn an entity from `template` and reparent it under `parent` (if
 /// provided). Goes through the AST-aware `set_parent` so the live
-/// `SceneJsnAst` stays in sync with the ECS hierarchy.
+/// scene document stays in sync with the ECS hierarchy.
 fn add_child_entity(
     commands: &mut Commands,
     parent: Option<Entity>,
@@ -2074,12 +2078,17 @@ fn on_tree_row_renamed(event: On<TreeRowRenamed>, mut commands: Commands, names:
     }
 
     commands.queue(move |world: &mut World| {
-        let cmd = SetJsnField {
+        let old_value = if old_name.is_empty() {
+            None
+        } else {
+            Some(jackdaw_bsn::BsnValue::String(old_name))
+        };
+        let cmd = SetBsnField {
             entity: source,
-            type_path: "bevy_ecs::name::Name".to_string(),
+            type_path: crate::commands::NAME_TYPE_PATH.to_string(),
             field_path: String::new(),
-            old_value: serde_json::Value::String(old_name),
-            new_value: serde_json::Value::String(new_name),
+            old_value,
+            new_value: jackdaw_bsn::BsnValue::String(new_name),
             was_derived: false,
         };
         let mut cmd = Box::new(cmd);
@@ -2189,8 +2198,8 @@ pub fn prefab_save_as_prefab(
             return;
         }
         let target = match world.get_resource::<crate::project::ProjectRoot>() {
-            Some(root) => root.root.join("assets/prefabs").join(format!("{name}.jsn")),
-            None => std::path::PathBuf::from(format!("{name}.jsn")),
+            Some(root) => root.root.join("assets/prefabs").join(format!("{name}.bsn")),
+            None => std::path::PathBuf::from(format!("{name}.bsn")),
         };
         info!(
             "prefab.save_as_prefab: bundling {} root(s) into {}",
@@ -2232,8 +2241,8 @@ pub fn prefab_save_scene_as_prefab(
 
     commands.queue(move |world: &mut World| {
         let target = match world.get_resource::<crate::project::ProjectRoot>() {
-            Some(root) => root.root.join("assets/prefabs").join(format!("{name}.jsn")),
-            None => std::path::PathBuf::from(format!("{name}.jsn")),
+            Some(root) => root.root.join("assets/prefabs").join(format!("{name}.bsn")),
+            None => std::path::PathBuf::from(format!("{name}.bsn")),
         };
         crate::prefab::operators::save_scene_as_prefab(world, &target);
         let mut pending = world.resource_mut::<PendingPrefabSave>();
@@ -2269,8 +2278,8 @@ pub fn prefab_save_as_variant(
             return;
         };
         let target = match world.get_resource::<crate::project::ProjectRoot>() {
-            Some(p) => p.root.join("assets/prefabs").join(format!("{name}.jsn")),
-            None => std::path::PathBuf::from(format!("{name}.jsn")),
+            Some(p) => p.root.join("assets/prefabs").join(format!("{name}.bsn")),
+            None => std::path::PathBuf::from(format!("{name}.bsn")),
         };
         crate::prefab::operators::save_as_variant(world, root, &target);
         let mut pending = world.resource_mut::<PendingPrefabSave>();
@@ -2424,7 +2433,7 @@ fn apply_hierarchy_filter(
 mod tests {
     use super::*;
     use jackdaw_api_internal::operator::OperatorParameters;
-    use jackdaw_jsn::PropertyValue;
+    use jackdaw_scene_types::PropertyValue;
     use std::collections::BTreeMap;
 
     fn empty_params() -> OperatorParameters {
@@ -2440,7 +2449,7 @@ mod tests {
     #[test]
     fn scene_root_tag_classifies_as_scene() {
         let mut world = World::new();
-        let root = world.spawn(jackdaw_jsn::SceneRootTag).id();
+        let root = world.spawn(jackdaw_scene_types::SceneRootTag).id();
         let plain = world.spawn_empty().id();
         assert_eq!(classify_entity(&world, root), EntityCategory::Scene);
         assert_ne!(classify_entity(&world, plain), EntityCategory::Scene);

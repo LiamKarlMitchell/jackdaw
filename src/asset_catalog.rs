@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use bevy::asset::UntypedAssetId;
 use bevy::prelude::*;
-use jackdaw_jsn::format::{JsnAssets, JsnCatalog, JsnHeader};
+use jackdaw_jsn::format::JsnCatalog;
 
 /// Project-level asset catalog for cross-scene deduplication.
 ///
@@ -13,8 +13,6 @@ use jackdaw_jsn::format::{JsnAssets, JsnCatalog, JsnHeader};
 pub struct AssetCatalog {
     /// `@Name` -> loaded `UntypedHandle` (populated at project open).
     pub handles: HashMap<String, UntypedHandle>,
-    /// The raw `JsnAssets` data (for re-serialization / UI browsing).
-    pub assets: JsnAssets,
     /// Reverse lookup: asset ID -> `@Name` (used during save to emit catalog refs).
     pub id_to_name: HashMap<UntypedAssetId, String>,
     /// Whether the catalog has unsaved changes.
@@ -22,8 +20,8 @@ pub struct AssetCatalog {
 }
 
 impl AssetCatalog {
-    /// Insert a runtime handle into the catalog. Does not mark dirty; use
-    /// [`add_to_catalog_assets`] to persist new serializable data.
+    /// Insert a runtime handle into the catalog. Does not mark dirty; the
+    /// caller sets `dirty` when the change should persist.
     pub fn insert(&mut self, name: String, handle: UntypedHandle) {
         self.id_to_name.insert(handle.id(), name.clone());
         self.handles.insert(name, handle);
@@ -45,22 +43,41 @@ pub fn load_catalog(world: &mut World) {
     };
 
     if !catalog_path.exists() {
-        info!("No catalog.jsn found, starting with empty catalog");
+        info!("No asset catalog found, starting with empty catalog");
         return;
     }
 
     let json = match std::fs::read_to_string(&catalog_path) {
         Ok(json) => json,
         Err(err) => {
-            warn!("Failed to read catalog.jsn: {err}");
+            warn!("Failed to read {}: {err}", catalog_path.display());
             return;
         }
     };
 
+    if catalog_path.extension().is_some_and(|e| e == "bsn") {
+        match jackdaw_bsn::load_bsn_assets(world, &json) {
+            Ok(entries) => {
+                let count = entries.len();
+                let mut catalog = world.resource_mut::<AssetCatalog>();
+                for entry in entries {
+                    // Scenes reference catalog assets as `@Name`.
+                    let name = format!("@{}", entry.name);
+                    catalog.id_to_name.insert(entry.handle.id(), name.clone());
+                    catalog.handles.insert(name, entry.handle);
+                }
+                catalog.dirty = false;
+                info!("Loaded asset catalog with {count} entries");
+            }
+            Err(err) => warn!("Failed to parse {}: {err}", catalog_path.display()),
+        }
+        return;
+    }
+
     let jsn_catalog: JsnCatalog = match serde_json::from_str(&json) {
         Ok(c) => c,
         Err(err) => {
-            warn!("Failed to parse catalog.jsn: {err}");
+            warn!("Failed to parse asset catalog: {err}");
             return;
         }
     };
@@ -73,7 +90,6 @@ pub fn load_catalog(world: &mut World) {
 
     // Populate the catalog resource
     let mut catalog = world.resource_mut::<AssetCatalog>();
-    catalog.assets = jsn_catalog.assets;
     for (name, handle) in loaded {
         catalog.id_to_name.insert(handle.id(), name.clone());
         catalog.handles.insert(name, handle);
@@ -97,18 +113,18 @@ pub fn save_catalog(world: &mut World) {
         return;
     }
 
-    let jsn_catalog = JsnCatalog {
-        jsn: JsnHeader::default(),
-        assets: catalog.assets.clone(),
-    };
-
-    let json = match serde_json::to_string_pretty(&jsn_catalog) {
-        Ok(json) => json,
-        Err(err) => {
-            warn!("Failed to serialize catalog: {err}");
-            return;
-        }
-    };
+    // The catalog persists as `.bsn`, reflected from the live asset stores;
+    // the cached JSON values only feed legacy tooling until deletion.
+    let refs: Vec<jackdaw_bsn::CatalogAssetRef> = catalog
+        .id_to_name
+        .iter()
+        .map(|(&asset_id, name)| jackdaw_bsn::CatalogAssetRef {
+            name: name.trim_start_matches(['@', '#']).to_string(),
+            type_id: asset_id.type_id(),
+            asset_id,
+        })
+        .collect();
+    let json = jackdaw_bsn::serialize_assets_to_bsn(world, &refs);
 
     // Ensure parent directory exists
     if let Some(parent) = catalog_path.parent() {
@@ -124,44 +140,34 @@ pub fn save_catalog(world: &mut World) {
     }
 }
 
-/// Add a named entry to the catalog's `JsnAssets` data (for persistence).
-pub fn add_to_catalog_assets(
-    catalog: &mut AssetCatalog,
-    type_path: &str,
-    name: &str,
-    value: serde_json::Value,
-    handle: UntypedHandle,
-) {
-    catalog
-        .assets
-        .0
-        .entry(type_path.to_string())
-        .or_default()
-        .insert(name.to_string(), value);
-    catalog.id_to_name.insert(handle.id(), name.to_string());
-    catalog.handles.insert(name.to_string(), handle);
-    catalog.dirty = true;
-}
-
 /// Resolve the catalog file path for loading.
 ///
-/// Prefers `.jsn/catalog.jsn`, falls back to legacy `assets/catalog.jsn`.
+/// Prefers `assets/catalog.bsn` (what saves write), then legacy `.jsn/`
+/// and assets-dir `.jsn` catalogs for migration.
 fn catalog_file_path(world: &World) -> Option<std::path::PathBuf> {
     let project = world.get_resource::<crate::project::ProjectRoot>()?;
-    let new_path = project.jsn_dir().join("catalog.jsn");
-    if new_path.is_file() {
-        return Some(new_path);
-    }
-    let legacy_path = project.assets_dir().join("catalog.jsn");
-    if legacy_path.is_file() {
-        return Some(legacy_path);
+    let legacy_dir = project.root.join(".jsn");
+    let candidates = [
+        project.assets_dir().join("catalog.bsn"),
+        // Legacy locations, read for migration; the next save moves the
+        // catalog to `assets/catalog.bsn`.
+        legacy_dir.join("catalog.bsn"),
+        legacy_dir.join("catalog.jsn"),
+        project.assets_dir().join("catalog.jsn"),
+    ];
+    for candidate in candidates {
+        if candidate.is_file() {
+            return Some(candidate);
+        }
     }
     // No catalog exists yet
-    Some(new_path)
+    Some(project.assets_dir().join("catalog.bsn"))
 }
 
-/// Always returns `.jsn/catalog.jsn`. Saves always go to the new location.
+/// Always returns `assets/catalog.bsn`. The catalog is committed project
+/// data (scenes reference its `@Name` entries), so it lives with the assets,
+/// not in the gitignored `.jackdaw/`.
 fn catalog_save_path(world: &World) -> Option<std::path::PathBuf> {
     let project = world.get_resource::<crate::project::ProjectRoot>()?;
-    Some(project.jsn_dir().join("catalog.jsn"))
+    Some(project.assets_dir().join("catalog.bsn"))
 }

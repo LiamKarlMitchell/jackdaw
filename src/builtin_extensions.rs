@@ -16,9 +16,9 @@ use jackdaw_feathers::tokens;
 /// defining module (what `TypePath` reports), not a re-export path. Tested
 /// against the real `TypePath` so a typo fails loudly.
 pub(crate) const WORLD_ENTITY_ICONS: &[(&str, Icon)] = &[
-    ("jackdaw_jsn::types::Brush", Icon::Cuboid),
-    ("jackdaw_jsn::types::Terrain", Icon::Mountain),
-    ("jackdaw_jsn::types::NavmeshRegion", Icon::Waypoints),
+    ("jackdaw_scene_types::types::Brush", Icon::Cuboid),
+    ("jackdaw_scene_types::types::Terrain", Icon::Mountain),
+    ("jackdaw_scene_types::types::NavmeshRegion", Icon::Waypoints),
     ("jackdaw::entity_ops::SceneFogVolume", Icon::CloudFog),
     ("jackdaw::entity_ops::SceneReflectionProbe", Icon::Sparkles),
     ("jackdaw::entity_ops::SceneAnimationPlayer", Icon::Play),
@@ -105,6 +105,87 @@ impl JackdawExtension for CoreWindowsExtension {
                         .world_mut()
                         .resource_mut::<crate::project_files::ProjectFilesState>()
                         .needs_refresh = true;
+                }),
+        );
+
+        ctx.register_window(
+            WindowDescriptor::new("jackdaw.remote.entities")
+                .with_name("Remote Entities")
+                .with_default_area(DefaultArea::Left)
+                .with_priority(20)
+                .with_build(|window| {
+                    window.spawn(crate::remote::entity_browser::remote_debug_workspace_content());
+                }),
+        );
+
+        ctx.register_window(
+            WindowDescriptor::new("jackdaw.debug.diagnostics")
+                .with_name("Remote Diagnostics")
+                .with_default_area(DefaultArea::Left)
+                .with_priority(21)
+                .with_build(|window| {
+                    crate::remote::debug::diagnostics::build_diagnostics_window(window);
+                }),
+        );
+
+        ctx.register_window(
+            WindowDescriptor::new("jackdaw.debug.queries")
+                .with_name("Remote Queries")
+                .with_default_area(DefaultArea::Center)
+                .with_priority(22)
+                .with_build(|window| {
+                    window.spawn(crate::remote::debug::queries::queries_panel_content());
+                }),
+        );
+
+        ctx.register_window(
+            WindowDescriptor::new("jackdaw.debug.archetypes")
+                .with_name("Remote Archetypes")
+                .with_default_area(DefaultArea::Center)
+                .with_priority(23)
+                .with_build(|window| {
+                    window.spawn(crate::remote::debug::archetypes::archetypes_panel_content());
+                }),
+        );
+
+        ctx.register_window(
+            WindowDescriptor::new("jackdaw.debug.schedules")
+                .with_name("Remote Schedules")
+                .with_default_area(DefaultArea::Center)
+                .with_priority(24)
+                .with_build(|window| {
+                    window.spawn(crate::remote::debug::schedules::schedules_panel_content());
+                }),
+        );
+
+        ctx.register_window(
+            WindowDescriptor::new("jackdaw.debug.graph")
+                .with_name("Remote System Graph")
+                .with_default_area(DefaultArea::Center)
+                .with_priority(25)
+                .with_build(|window| {
+                    window.spawn(crate::remote::debug::depgraph::depgraph_panel_content());
+                }),
+        );
+
+        ctx.register_window(
+            WindowDescriptor::new("jackdaw.debug.relationships")
+                .with_name("Remote Relationships")
+                .with_default_area(DefaultArea::Center)
+                .with_priority(26)
+                .with_build(|window| {
+                    window
+                        .spawn(crate::remote::debug::relationships::relationships_panel_content());
+                }),
+        );
+
+        ctx.register_window(
+            WindowDescriptor::new("jackdaw.remote.inspector")
+                .with_name("Remote Inspector")
+                .with_default_area(DefaultArea::RightSidebar)
+                .with_priority(20)
+                .with_build(|window| {
+                    window.spawn(crate::remote::remote_inspector::remote_inspector());
                 }),
         );
     }
@@ -414,9 +495,9 @@ mod tests {
         {
             let registry = world.resource::<AppTypeRegistry>();
             let mut registry = registry.write();
-            registry.register::<jackdaw_jsn::Brush>();
-            registry.register::<jackdaw_jsn::Terrain>();
-            registry.register::<jackdaw_jsn::NavmeshRegion>();
+            registry.register::<jackdaw_scene_types::Brush>();
+            registry.register::<jackdaw_scene_types::Terrain>();
+            registry.register::<jackdaw_scene_types::NavmeshRegion>();
             registry.register::<crate::entity_ops::SceneFogVolume>();
             registry.register::<crate::entity_ops::SceneReflectionProbe>();
             registry.register::<crate::entity_ops::SceneAnimationPlayer>();
@@ -436,15 +517,17 @@ mod tests {
 
         let cases: &[(Entity, Icon)] = &[
             (
-                world.spawn(jackdaw_jsn::Brush::default()).id(),
+                world.spawn(jackdaw_scene_types::Brush::default()).id(),
                 Icon::Cuboid,
             ),
             (
-                world.spawn(jackdaw_jsn::Terrain::default()).id(),
+                world.spawn(jackdaw_scene_types::Terrain::default()).id(),
                 Icon::Mountain,
             ),
             (
-                world.spawn(jackdaw_jsn::NavmeshRegion::default()).id(),
+                world
+                    .spawn(jackdaw_scene_types::NavmeshRegion::default())
+                    .id(),
                 Icon::Waypoints,
             ),
             (

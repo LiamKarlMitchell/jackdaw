@@ -93,7 +93,6 @@ fn rebuild_navmesh_visuals(
 ) {
     let handle_id = navmesh_handle.id();
 
-    // Check if we need to rebuild
     let handle_changed = visuals.current_id != Some(handle_id);
     let asset_modified = asset_events.read().any(|ev| match ev {
         AssetEvent::Added { id } | AssetEvent::Modified { id } => *id == handle_id,
@@ -293,7 +292,7 @@ fn rebuild_navmesh_visuals(
 }
 
 fn on_navmesh_region_removed(
-    _trigger: On<Remove, jackdaw_jsn::NavmeshRegion>,
+    _trigger: On<Remove, jackdaw_scene_types::NavmeshRegion>,
     mut commands: Commands,
     fills: Query<Entity, With<NavmeshFillMesh>>,
     poly_fills: Query<Entity, With<NavmeshPolyFillMesh>>,

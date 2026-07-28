@@ -3,9 +3,9 @@
 //! A thin facade over [`jackdaw_api_internal`]. Only types and
 //! functions intended for third-party extension and game authors are
 //! re-exported here. Editor-host plumbing (the loader plugin, the
-//! catalog, enable/disable helpers, internal component markers, and
-//! the FFI entry structs) stays behind `jackdaw_api_internal` and is
-//! used by the editor binary and by `jackdaw_loader`.
+//! catalog, enable/disable helpers, and internal component markers)
+//! stays behind `jackdaw_api_internal` and is used by the editor
+//! binary and by `jackdaw_loader`.
 //!
 //! # Static consumer
 //!
@@ -44,6 +44,51 @@ pub use jackdaw_api_internal::{
 
 pub use jackdaw_api_internal::lifecycle::ExtensionKind;
 
+/// Drain the process's reflected types into a project schema and return
+/// it as JSON. Called by the generated project shim's
+/// `jackdaw_extract_schema` export, which the game runner invokes over
+/// FFI after `dlopen`.
+///
+/// It lives in `jackdaw_api` so it compiles into the SDK dylib: the
+/// bevy_reflect machinery it instantiates (per-type `type_info` cells and
+/// the auto-registration inventory) then resides in the one dylib the
+/// shim and the editor already share, instead of in the runner binary,
+/// which cannot resolve those symbols when statically linked on Windows.
+/// The shim submitted its `#[derive(Reflect)]` types into that same
+/// inventory when it was dlopened, so draining here sees them.
+#[doc(hidden)]
+pub fn __extract_project_schema_json() -> String {
+    let mut registry = bevy::reflect::TypeRegistry::default();
+    registry.register_derived_types();
+    let schema = jackdaw_project_build::schema::extract_from_registry(&registry);
+    serde_json::to_string(&schema)
+        .unwrap_or_else(|_| String::from(r#"{"components":[],"resources":[]}"#))
+}
+
+/// Assemble the engine app, let the project install its plugin via
+/// `add_game`, and run it. Called by the generated project shim's
+/// `jackdaw_run_game` export, which the game runner invokes over FFI.
+///
+/// Like schema extraction, this lives in `jackdaw_api` so the whole bevy
+/// app is built and run inside the SDK dylib and the project dylib - both
+/// of which link on Windows - instead of in the runner binary, which as a
+/// secondary binary cannot link bevy there. The runner just `dlopen`s and
+/// calls this, staying bevy-free.
+#[doc(hidden)]
+pub fn __run_project_game(add_game: impl FnOnce(&mut bevy::app::App)) {
+    use bevy::prelude::*;
+    let mut app = App::new();
+    app.add_plugins(jackdaw_runtime::maybe_windowless(DefaultPlugins));
+    app.add_plugins(jackdaw_runtime::JackdawPlugin);
+    // A fallback camera so the PIE frame stream renders something; real
+    // projects spawn their own and this becomes redundant.
+    app.add_systems(Startup, |mut commands: Commands| {
+        commands.spawn(Camera3d::default());
+    });
+    add_game(&mut app);
+    app.run();
+}
+
 /// Maps component type paths to the icon the outliner shows for entities
 /// carrying them. Extensions seed it through
 /// [`ExtensionContext::register_entity_icon`].
@@ -60,12 +105,6 @@ pub mod inspector {
 /// `#[operator]` attribute macro. See [`jackdaw_api_macros`] for the
 /// supported keys.
 pub use jackdaw_api_macros::operator;
-
-/// Emit the FFI entry symbol a dylib extension needs.
-pub use jackdaw_api_internal::export_extension;
-
-/// Emit the FFI entry symbol a dylib game needs.
-pub use jackdaw_api_internal::export_game;
 
 // --- Sub-modules (curated) ---
 
@@ -106,24 +145,16 @@ pub mod runtime {
     };
 }
 
-/// JSN primitives re-exported for operator parameter marshalling.
-pub use jackdaw_jsn as jsn;
+/// Format-independent scene primitives re-exported for operator parameter
+/// marshalling: `PropertyValue`, `Brush`, and the other `jackdaw_scene_types`
+/// types, exposed here so extension authors have one import path.
+pub mod scene {
+    pub use jackdaw_scene_types::*;
+}
 
-/// Minimal UI primitives an extension needs to spawn editor-style
-/// widgets. Today this is just `button(ButtonProps)`; `label()` and
-/// other primitives will land here as they become first-class.
-///
-/// Designed to dovetail with the (future) UI prefab system: every
-/// type exposed here is data, every spawn fn returns a `Bundle`. A
-/// JSN-serialised `ButtonProps` should round-trip through the same
-/// constructor an extension calls at runtime, so extensions and
-/// scene-authored UI share one code path.
-///
-/// Surface stays deliberately small. If you find yourself wanting
-/// `ButtonVariant`, `ButtonSize`, or other feathers internals,
-/// either the missing primitive should be designed into the prefab
-/// schema first or `jackdaw_feathers` should grow a builder method
-/// that hides the choice.
+/// UI primitives an extension needs to spawn editor-style widgets:
+/// `button(ButtonProps)` plus the radial quick-menu below. Kept
+/// deliberately small.
 pub mod ui {
     pub use jackdaw_feathers::button::{
         button, operator_button, operator_button_variant, ButtonProps,

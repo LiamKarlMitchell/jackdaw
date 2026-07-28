@@ -32,7 +32,7 @@ pub use self::mesh::{
 };
 pub use edit_mode_systems::BrushHalfedge;
 pub use jackdaw_geometry::MeshMirror;
-pub use jackdaw_jsn::{Brush, BrushFaceData, BrushPlane};
+pub use jackdaw_scene_types::{Brush, BrushFaceData, BrushPlane};
 pub use knife_mode::{KnifeMode, KnifePathPoint, KnifeSnapKind, KnifeSnapTarget};
 pub use preview::{ActivePreview, PreviewMesh, PreviewState};
 pub use topology_ops::edge_bevel::EdgeBevelModalState;
@@ -374,15 +374,19 @@ fn apply_brush(world: &mut World, entity: Entity, target: &Brush) {
     }
 }
 
-/// Serialize a Brush component to JSON and store it in the AST.
+/// Write a Brush component into the live scene document.
 pub fn sync_brush_to_ast(world: &mut World, entity: Entity, brush: &Brush) {
-    // `jackdaw_jsn::types::Brush`; the canonical reflected type
-    // path (Brush is defined directly in `jackdaw_jsn::types`, not a
-    // `types::brush` submodule; historically this string was wrong
-    // and the AST ended up with a `types::brush::Brush` key that
-    // `load_scene_from_jsn` then skipped with an `Unknown type`
-    // warning and silently lost the Brush on every scene reload).
-    crate::commands::sync_component_to_ast(world, entity, "jackdaw_jsn::types::Brush", brush);
+    // `jackdaw_scene_types::types::Brush` is the canonical reflected type
+    // path (Brush lives directly in the crate's `types` module, not a
+    // `types::brush` submodule; historically this string was wrong and the
+    // document ended up with a `types::brush::Brush` key the loader skipped
+    // with an `Unknown type` warning, silently losing the Brush on reload).
+    crate::commands::sync_component_to_ast(
+        world,
+        entity,
+        "jackdaw_scene_types::types::Brush",
+        brush,
+    );
 }
 
 /// Watch for any `Changed<Brush>` and mirror the new state into the
@@ -447,26 +451,20 @@ fn sync_changed_modifier_stacks_to_ast(
             crate::commands::sync_component_to_ast(world, entity, type_path, &stack);
         }
         for entity in removed_entities {
-            if let Some(node) = world
-                .resource_mut::<jackdaw_jsn::SceneJsnAst>()
-                .node_for_entity_mut(entity)
-            {
-                node.components.remove(type_path);
+            let mut ast = world.resource_mut::<jackdaw_bsn::SceneBsnAst>();
+            if let Some(node) = ast.ast_for(entity) {
+                ast.remove_component_patch(node, type_path);
             }
         }
     });
 }
-
-// `impl EditorMeta for Brush` lives in `jackdaw_jsn` so the orphan
-// rule is satisfied (trait and type share a crate); the category
-// is "Brush", same as before.
 
 pub struct BrushPlugin;
 
 impl Plugin for BrushPlugin {
     fn build(&self, app: &mut App) {
         // `Brush`/`BrushFaceData`/`BrushPlane` register through
-        // `JsnPlugin`. Picker category lives on `Brush` via
+        // `SceneTypesPlugin`. Picker category lives on `Brush` via
         // `#[reflect(@EditorCategory("Brush"))]`.
         app.register_type::<EditMode>()
             .register_type::<BrushEditMode>()

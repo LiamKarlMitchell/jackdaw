@@ -1,6 +1,6 @@
 //! Multi-scene editor state. Owns the tab list; the active tab's
 //! contents live in the live Bevy world, inactive tabs hold a
-//! `SceneJsnAst` snapshot plus the per-tab view state and history.
+//! scene-document snapshot plus the per-tab view state and history.
 
 pub mod confirm_dialog;
 pub mod operators;
@@ -102,12 +102,13 @@ pub enum TabKind {
 pub enum TabContent {
     /// Scene document. `None` is the just-pushed / never-captured state
     /// for an untitled tab; `Some` is what `capture_active_tab` stores
-    /// during a swap.
-    Scene(Option<jackdaw_jsn::SceneJsnAst>),
+    /// during a swap. Boxed: the document holds a whole ECS world, so the
+    /// variant would otherwise dwarf `Prefab` (a path).
+    Scene(Option<Box<jackdaw_bsn::SceneBsnAst>>),
     /// Prefab document. The AST lives in `PrefabAstCache`, keyed by
-    /// this canonical path. Capturing flushes the live `SceneJsnAst`
-    /// resource into the cache entry; activating installs the cache
-    /// entry back into the resource.
+    /// this canonical path. Capturing flushes the live scene document
+    /// into the cache entry; activating installs the cache entry back
+    /// into the live world.
     Prefab(crate::prefab::CanonicalPrefabPath),
 }
 
@@ -146,19 +147,6 @@ impl SceneTab {
             history_depth_at_last_check: 0,
         }
     }
-
-    /// Read the tab's AST regardless of variant. For `Prefab(path)`,
-    /// reads through `cache`. Returns `None` if no AST is available
-    /// (untitled scene, or prefab whose cache entry is missing).
-    pub fn ast_view<'a>(
-        &'a self,
-        cache: &'a crate::prefab::PrefabAstCache,
-    ) -> Option<&'a jackdaw_jsn::SceneJsnAst> {
-        match &self.content {
-            TabContent::Scene(opt) => opt.as_ref(),
-            TabContent::Prefab(path) => cache.get_canonical(path),
-        }
-    }
 }
 
 /// When `Scenes` mutates, mirror the open-tab paths into the project
@@ -183,7 +171,7 @@ pub fn persist_tabs_to_project_config(
         .collect();
     let last_active_tab = scenes.active;
 
-    let cfg = &mut project_root.config.project;
+    let cfg = &mut project_root.config;
     if cfg.last_open_tabs == last_open_tabs && cfg.last_active_tab == last_active_tab {
         return;
     }

@@ -46,7 +46,14 @@ use super::{
 use crate::inspector::prefab_field_dots::{PrefabInstanceCtx, inspector_type_paths_for};
 use crate::prefab::PrefabAstCache;
 use bevy::picking::hover::Hovered;
-use jackdaw_jsn::SceneJsnAst;
+
+/// The live scene-document resource bundled into one param so the systems
+/// that read it stay under the system param-count limit.
+#[derive(bevy::ecs::system::SystemParam)]
+pub(crate) struct SceneAsts<'w> {
+    pub(crate) bsn: Res<'w, jackdaw_bsn::SceneBsnAst>,
+    pub(crate) project_types: Res<'w, crate::project_types::ProjectTypes>,
+}
 
 pub(crate) fn add_component_displays(
     _: On<Add, Selected>,
@@ -60,7 +67,7 @@ pub(crate) fn add_component_displays(
     icon_font: Res<IconFont>,
     editor_font: Res<EditorFont>,
     materials: Res<Assets<StandardMaterial>>,
-    ast: Res<jackdaw_jsn::SceneJsnAst>,
+    asts: SceneAsts,
     prefab_cache: Res<PrefabAstCache>,
     child_of_query: Query<&bevy::ecs::hierarchy::ChildOf>,
     isa_query: Query<&crate::prefab::IsA>,
@@ -77,7 +84,7 @@ pub(crate) fn add_component_displays(
     let sel_count = selection.entities.len();
 
     let jsn_type_paths = inspector_type_paths_for(
-        &ast,
+        &asts.bsn,
         &prefab_cache,
         source_entity,
         entity_ref,
@@ -85,7 +92,6 @@ pub(crate) fn add_component_displays(
         &isa_query,
     );
 
-    // Build the same component panel into every Inspector instance.
     // Multi-instance dock layouts can host more than one inspector
     // tab; each gets its own UI subtree but mirrors the same data.
     for inspector in &inspectors {
@@ -104,12 +110,12 @@ pub(crate) fn add_component_displays(
             false,
             &materials,
             &jsn_type_paths,
-            Some(&ast),
+            Some(&asts.bsn),
             Some(&prefab_cache),
             &collapse_state,
+            Some(&asts.project_types),
         );
 
-        // Set up monitoring: watch the selected entity for InspectorDirty
         commands.entity(inspector).insert((
             InspectorTarget(primary),
             Monitor(primary),
@@ -137,9 +143,10 @@ pub(crate) fn build_inspector_displays(
     _read_only: bool,
     materials: &Assets<StandardMaterial>,
     jsn_type_paths: &HashSet<String>,
-    scene_ast: Option<&SceneJsnAst>,
+    scene_ast: Option<&jackdaw_bsn::SceneBsnAst>,
     prefab_cache: Option<&PrefabAstCache>,
     collapse_state: &super::InspectorCollapseState,
+    project_types: Option<&crate::project_types::ProjectTypes>,
 ) {
     // Show multi-selection header when multiple entities are selected
     if selection_count > 1 {
@@ -169,23 +176,25 @@ pub(crate) fn build_inspector_displays(
     let registry = type_registry.read();
 
     // Check for prefab baseline (override tracking)
-    let baseline = entity_ref.get::<jackdaw_jsn::JsnPrefabBaseline>().cloned();
+    let baseline = entity_ref
+        .get::<jackdaw_scene_types::PrefabBaseline>()
+        .cloned();
 
     // Prefab-instance context: if this entity sits inside an IsA
     // subtree, override info comes from the prefab AST + cache and the
     // revert / right-click actions route to the new prefab operators.
     let prefab_ctx: Option<PrefabInstanceCtx> = scene_ast.and_then(|ast| {
         let cache = prefab_cache?;
-        let key = ast.key_for_entity(source_entity)?;
-        if !crate::prefab::overrides::is_inside_prefab_instance(ast, key) {
+        let node = ast.ast_for(source_entity)?;
+        if !crate::prefab::overrides_bsn::is_inside_prefab_instance(ast, node) {
             return None;
         }
-        let (path, prefab_entity_id) = crate::prefab::overrides::resolve_inheritance(ast, key)?;
-        let instance_root = ast.ancestor_with_component(key, "jackdaw::prefab::components::IsA")?;
-        let instance_entity = ast.nodes.get(instance_root).and_then(|n| n.ecs_entity)?;
+        let (path, prefab_entity_id) =
+            crate::prefab::overrides_bsn::resolve_inheritance(ast, node)?;
+        let instance_entity = ast
+            .ancestor_with_component(node, "jackdaw::prefab::components::IsA")
+            .and_then(|n| ast.ecs_for_ast(n))?;
         Some(PrefabInstanceCtx {
-            entity_key: key,
-            instance_root,
             instance_entity,
             has_cached_prefab: cache.get(&path).is_some(),
             prefab_path: path,
@@ -337,10 +346,14 @@ pub(crate) fn build_inspector_displays(
             let (Some(ast), Some(cache)) = (scene_ast, prefab_cache) else {
                 return false;
             };
-            crate::prefab::overrides::field_is_overridden(
+            let Some(node) = ast.ast_for(source_entity) else {
+                return false;
+            };
+            let get_prefab = |p: &std::path::Path| cache.get(p);
+            crate::prefab::overrides_bsn::field_is_overridden(
                 ast,
-                cache,
-                ctx.entity_key,
+                &get_prefab,
+                node,
                 type_path,
                 None,
             )
@@ -352,7 +365,7 @@ pub(crate) fn build_inspector_displays(
         // prefab instance so the right-click menu can offer Revert /
         // Apply on every component. The revert ICON's routing still
         // checks `is_overridden_prefab` below so the legacy
-        // `JsnPrefabBaseline` path keeps using its existing operator
+        // `PrefabBaseline` path keeps using its existing operator
         // when both systems coexist.
         let spec_prefab_ctx = prefab_ctx.clone();
         let revert_through_prefab = is_overridden_prefab;
@@ -485,7 +498,7 @@ pub(crate) fn build_inspector_displays(
             }
 
             // Priority 3c: Terrain, custom inspector sections
-            if type_id == TypeId::of::<jackdaw_jsn::Terrain>() {
+            if type_id == TypeId::of::<jackdaw_scene_types::Terrain>() {
                 crate::terrain::inspector::spawn_terrain_inspector_container(commands, body_entity);
                 continue;
             }
@@ -518,6 +531,51 @@ pub(crate) fn build_inspector_displays(
             TextColor(tokens::TEXT_SECONDARY),
             ChildOf(body_entity),
         ));
+    }
+
+    // Project (dylib-provided) components are not real ECS components in the
+    // editor, so the archetype pass above never sees them. Render each one the
+    // document authored on this entity from its extracted schema; values come
+    // from the document and edits round-trip back through the same field
+    // widgets (see `project_component_display`).
+    if let (Some(project_types), Some(ast)) = (project_types, scene_ast)
+        && let Some(node) = ast.ast_for(source_entity)
+    {
+        for type_path in ast.component_type_paths(node) {
+            let Some(schema) = project_types.component(&type_path) else {
+                continue;
+            };
+            let (display_entity, body_entity) = spawn_component_display(
+                commands,
+                ComponentDisplaySpec {
+                    name: &schema.short_name,
+                    type_path: &type_path,
+                    entity: source_entity,
+                    component: None,
+                    is_overridden: false,
+                    prefab_ctx: None,
+                    revert_through_prefab: false,
+                    icon_font: &icon_font.0,
+                    editor_font: &editor_font.0,
+                    collapse_state,
+                },
+            );
+            commands
+                .entity(display_entity)
+                .insert(ChildOf(inspector_entity));
+            super::project_component_display::spawn_project_component_fields(
+                commands,
+                body_entity,
+                schema,
+                ast,
+                node,
+                source_entity,
+                type_registry,
+                &editor_font.0,
+                &icon_font.0,
+                names,
+            );
+        }
     }
 
     // Add Component button is in the static layout header (layout.rs entity_inspector)
@@ -593,7 +651,7 @@ pub(crate) fn on_inspector_dirty(
     editor_font: Res<EditorFont>,
     displays: Query<Entity, Or<(With<ComponentDisplay>, With<ComponentPicker>)>>,
     materials: Res<Assets<StandardMaterial>>,
-    ast: Res<jackdaw_jsn::SceneJsnAst>,
+    asts: SceneAsts,
     prefab_cache: Res<PrefabAstCache>,
     child_of_query: Query<&bevy::ecs::hierarchy::ChildOf>,
     isa_query: Query<&crate::prefab::IsA>,
@@ -656,7 +714,7 @@ pub(crate) fn on_inspector_dirty(
         let sel_count = selection.entities.len();
 
         let jsn_type_paths = inspector_type_paths_for(
-            &ast,
+            &asts.bsn,
             &prefab_cache,
             source_entity,
             entity_ref,
@@ -679,9 +737,10 @@ pub(crate) fn on_inspector_dirty(
             false,
             &materials,
             &jsn_type_paths,
-            Some(&ast),
+            Some(&asts.bsn),
             Some(&prefab_cache),
             &collapse_state,
+            Some(&asts.project_types),
         );
     }
 
@@ -909,7 +968,7 @@ pub(crate) fn spawn_component_display(
 
         // Revert button (only shown for overridden prefab components).
         // Two code paths share the visual: the legacy
-        // `JsnPrefabBaseline` system dispatches through
+        // `PrefabBaseline` system dispatches through
         // `ComponentRevertBaselineOp` (and uses `ButtonOperatorCall`
         // for the rich tooltip popover); the new prefab system calls
         // `prefab::operators::revert_component` directly with the
@@ -1032,8 +1091,6 @@ pub(crate) fn spawn_component_display(
                 }
                 target.entity = Some(entity);
                 target.instance_entity = Some(menu_ctx.instance_entity);
-                target.entity_key = Some(menu_ctx.entity_key);
-                target.instance_root = Some(menu_ctx.instance_root);
                 target.prefab_entity_id = Some(menu_ctx.prefab_entity_id);
                 target.prefab_path = Some(menu_ctx.prefab_path.clone());
                 target.type_path = Some(menu_type_path.clone());

@@ -3,17 +3,18 @@ use std::sync::{Mutex, mpsc};
 
 use bevy::{
     asset::RenderAssetUsages,
+    feathers::cursor::{EntityCursor, OverrideCursor},
     image::{CompressedImageFormats, ImageSampler, ImageType},
     picking::hover::Hovered,
     prelude::*,
     render::render_resource::{Extent3d, TextureDimension, TextureSampleType},
     tasks::{AsyncComputeTaskPool, Task, futures_lite::future},
-    window::{PrimaryWindow, RawHandleWrapper},
+    window::{PrimaryWindow, RawHandleWrapper, SystemCursorIcon},
 };
 use jackdaw_feathers::button::ButtonOperatorCall;
 use jackdaw_feathers::text_edit::TextEditValue;
 use jackdaw_feathers::tooltip::Tooltip;
-use jackdaw_feathers::{file_browser, icons, icons::IconFont, tokens};
+use jackdaw_feathers::{file_browser, icons, icons::EditorFont, icons::IconFont, tokens};
 use jackdaw_widgets::file_browser::{FileBrowserItem, FileItemDoubleClicked};
 use rfd::AsyncFileDialog;
 
@@ -94,7 +95,16 @@ pub struct ActiveAssetDrag {
     /// point; image thumbnails aren't `FileBrowserItem` rows, so the
     /// drop handler can't recover the path from the dropped entity.
     pub image: Option<PathBuf>,
+    /// The floating drag-ghost entity that follows the cursor while a drag
+    /// is in flight. Spawned and despawned by `manage_asset_drag_ghost`,
+    /// keyed off `path`/`image`.
+    pub ghost: Option<Entity>,
 }
+
+/// Marker on the floating drag-ghost node (a dimmed icon + label that
+/// follows the cursor during an asset-browser drag).
+#[derive(Component)]
+struct AssetDragGhost;
 
 pub struct AssetBrowserPlugin;
 
@@ -116,6 +126,7 @@ impl Plugin for AssetBrowserPlugin {
                     update_asset_browser_filter,
                     toggle_prefabs_only_chip,
                     update_prefabs_only_chip_style,
+                    manage_asset_drag_ghost,
                 )
                     .run_if(in_state(crate::AppState::Editor)),
             )
@@ -123,6 +134,127 @@ impl Plugin for AssetBrowserPlugin {
             .add_observer(handle_select_asset_preview)
             .add_observer(on_asset_browser_context_action);
     }
+}
+
+/// Drive the drag-ghost and the grab cursor from the current
+/// [`ActiveAssetDrag`]: while a drag is live, force a "grabbing" cursor and
+/// float a dimmed icon + filename card under the pointer; tear both down
+/// when the drag ends. One system, no per-entry observers.
+fn manage_asset_drag_ghost(
+    mut commands: Commands,
+    mut drag: ResMut<ActiveAssetDrag>,
+    mut cursor: ResMut<OverrideCursor>,
+    windows: Query<&Window, With<PrimaryWindow>>,
+    editor_font: Res<EditorFont>,
+    icon_font: Res<IconFont>,
+    mut ghost_nodes: Query<&mut Node, With<AssetDragGhost>>,
+) {
+    let active = drag.path.as_ref().or(drag.image.as_ref()).cloned();
+    let cursor_pos = windows
+        .single()
+        .ok()
+        .and_then(bevy::prelude::Window::cursor_position);
+
+    // Grab cursor: set while dragging (without clobbering another tool's
+    // override); clear our own when the drag ends.
+    let grabbing = Some(EntityCursor::System(SystemCursorIcon::Grabbing));
+    if active.is_some() {
+        if cursor.0.is_none() {
+            cursor.0 = grabbing;
+        }
+    } else if cursor.0 == grabbing {
+        cursor.0 = None;
+    }
+
+    match (active, drag.ghost) {
+        (Some(path), None) => {
+            let name = path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let icon = file_browser::file_icon(&name);
+            let pos = cursor_pos.unwrap_or(Vec2::ZERO);
+            let ghost = spawn_asset_drag_ghost(
+                &mut commands,
+                &editor_font.0,
+                &icon_font.0,
+                icon,
+                &name,
+                pos,
+            );
+            drag.ghost = Some(ghost);
+        }
+        (Some(_), Some(ghost)) => {
+            if let Some(pos) = cursor_pos
+                && let Ok(mut node) = ghost_nodes.get_mut(ghost)
+            {
+                node.left = Val::Px(pos.x + 14.0);
+                node.top = Val::Px(pos.y + 8.0);
+            }
+        }
+        (None, Some(ghost)) => {
+            commands.entity(ghost).try_despawn();
+            drag.ghost = None;
+        }
+        (None, None) => {}
+    }
+}
+
+/// Spawn the dimmed drag-ghost card at `pos`. `Pickable::IGNORE` so it never
+/// intercepts the drop target under the cursor.
+fn spawn_asset_drag_ghost(
+    commands: &mut Commands,
+    font: &Handle<Font>,
+    icon_font: &Handle<Font>,
+    icon: icons::Icon,
+    name: &str,
+    pos: Vec2,
+) -> Entity {
+    commands
+        .spawn((
+            AssetDragGhost,
+            Node {
+                position_type: PositionType::Absolute,
+                left: Val::Px(pos.x + 14.0),
+                top: Val::Px(pos.y + 8.0),
+                flex_direction: FlexDirection::Row,
+                align_items: AlignItems::Center,
+                column_gap: Val::Px(6.0),
+                padding: UiRect::axes(Val::Px(8.0), Val::Px(5.0)),
+                border: UiRect::all(Val::Px(1.0)),
+                border_radius: BorderRadius::all(Val::Px(tokens::BORDER_RADIUS_MD)),
+                max_width: Val::Px(220.0),
+                overflow: Overflow::clip(),
+                ..default()
+            },
+            BackgroundColor(tokens::PANEL_BG.with_alpha(0.85)),
+            BorderColor::all(tokens::BORDER_SUBTLE.with_alpha(0.8)),
+            GlobalZIndex(10_000),
+            Pickable::IGNORE,
+            children![
+                (
+                    Text::new(String::from(icon.unicode())),
+                    TextFont {
+                        font: icon_font.clone().into(),
+                        font_size: tokens::ICON_SM,
+                        ..default()
+                    },
+                    TextColor(tokens::TEXT_SECONDARY.with_alpha(0.75)),
+                    Pickable::IGNORE,
+                ),
+                (
+                    Text::new(name.to_string()),
+                    TextFont {
+                        font: font.clone().into(),
+                        font_size: tokens::TEXT_SIZE_SM,
+                        ..default()
+                    },
+                    TextColor(tokens::TEXT_PRIMARY.with_alpha(0.75)),
+                    Pickable::IGNORE,
+                ),
+            ],
+        ))
+        .id()
 }
 
 fn on_asset_browser_context_action(
@@ -378,7 +510,6 @@ fn refresh_browser_on_change(
                 let path = entry.path();
                 let is_directory = entry.file_type().ok()?.is_dir();
 
-                // Build texture info for image files
                 let texture_info = if !is_directory && is_image_file_path(&path) {
                     let ext = path
                         .extension()
@@ -728,11 +859,13 @@ fn refresh_browser_on_change(
                 },
             );
 
-            // Prefab entries: track drag start so the viewport's drop
-            // handler can pull the source path out of `ActiveAssetDrag`
-            // and route through `spawn_instance`. Clear on DragEnd if
-            // nothing consumed it.
-            if entry.is_prefab {
+            // Prefab entries and hand-authored `.bsn` scenes: track drag
+            // start so the viewport's drop handler can pull the source path
+            // out of `ActiveAssetDrag` and route through `spawn_instance`,
+            // which normalizes a plain scene into an instanceable prefab.
+            // Clear on DragEnd if nothing consumed it.
+            let is_bsn_scene = entry.path.extension().is_some_and(|e| e == "bsn");
+            if entry.is_prefab || is_bsn_scene {
                 let drag_path = entry.path.clone();
                 commands.entity(item_entity).observe(
                     move |_: On<Pointer<DragStart>>, mut drag: ResMut<ActiveAssetDrag>| {
@@ -758,7 +891,6 @@ fn refresh_browser_on_change(
         }
     }
 
-    // Build breadcrumb from the full current directory path.
     // Each path component is a clickable button that navigates to that directory.
     let current_dir = state.current_directory.to_string_lossy().to_string();
 
@@ -982,12 +1114,12 @@ pub fn apply_texture(
     asset_server: Res<AssetServer>,
     mut materials: ResMut<Assets<StandardMaterial>>,
     registry: Res<MaterialRegistry>,
-    brush_groups: Query<(), With<jackdaw_jsn::types::BrushGroup>>,
+    brush_groups: Query<(), With<jackdaw_scene_types::types::BrushGroup>>,
     children_query: Query<&Children>,
     mut commands: Commands,
 ) -> OperatorResult {
     let path: String = match params.0.get("path") {
-        Some(jackdaw_jsn::PropertyValue::String(s)) => s.to_string(),
+        Some(jackdaw_scene_types::PropertyValue::String(s)) => s.to_string(),
         _ => {
             warn!("material.apply_texture called without a String `path` parameter");
             return OperatorResult::Cancelled;
@@ -1429,7 +1561,6 @@ fn poll_asset_browser_folder(world: &mut World) {
         state.current_directory = path.clone();
         state.needs_refresh = true;
 
-        // Set up filesystem watcher for the new root.
         let mut commands = world.commands();
         setup_directory_watcher(&path, &mut commands);
 

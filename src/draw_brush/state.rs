@@ -1,7 +1,7 @@
 use crate::commands::{EditorCommand, deselect_entities};
 use crate::draw_brush::{BrushStableId, StableIdCounter, entity_by_stable_id};
 use bevy::prelude::*;
-use jackdaw_jsn::{Brush, BrushGroup};
+use jackdaw_scene_types::{Brush, BrushGroup};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum DrawPhase {
@@ -201,8 +201,8 @@ impl EditorCommand for CreateBrushCommand {
         if let Some(entity) = entity_by_stable_id(world, self.data.stable_id) {
             deselect_entities(world, &[entity]);
             world
-                .resource_mut::<jackdaw_jsn::SceneJsnAst>()
-                .remove_node(entity);
+                .resource_mut::<jackdaw_bsn::SceneBsnAst>()
+                .remove_entity_node(entity);
             if let Ok(entity_mut) = world.get_entity_mut(entity) {
                 entity_mut.despawn();
             }

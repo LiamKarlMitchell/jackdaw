@@ -5,19 +5,72 @@ use std::{
 
 use bevy::prelude::*;
 use jackdaw_api_internal::paths::{last_new_project_location_path, recent_file_path};
-use jackdaw_jsn::format::{JsnHeader, JsnProject, JsnProjectConfig};
 use serde::{Deserialize, Serialize};
 
 /// Resource holding the active project root directory and its config.
 #[derive(Resource)]
 pub struct ProjectRoot {
     pub root: PathBuf,
-    pub config: JsnProject,
+    pub config: ProjectConfig,
+}
+
+/// Native editor project configuration persisted to `.jackdaw/project.json`.
+/// Carries the same fields the legacy JSN project config held, without the
+/// vestigial format-header wrapper.
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+pub struct ProjectConfig {
+    /// Human-readable project name.
+    pub name: String,
+    /// Optional description.
+    #[serde(default)]
+    pub description: String,
+    /// Default scene to open, relative to the project root.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_scene: Option<String>,
+    /// Persisted editor layout state. Opaque here; consumers parse it as
+    /// the `jackdaw_panels` workspace state.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub layout: Option<serde_json::Value>,
+    /// Scene paths (relative to the project root) open in the tab strip when
+    /// the project was last closed. Restored in order on the next launch.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub last_open_tabs: Vec<String>,
+    /// Index into `last_open_tabs` of the tab that was active. Clamped on load.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub last_active_tab: usize,
+}
+
+fn is_zero(n: &usize) -> bool {
+    *n == 0
+}
+
+/// Legacy on-disk shape: `.jackdaw/project.json` and `project.jsn` files
+/// written before the native config, which wrapped the fields as
+/// `{"jsn":{..},"project":{..}}`.
+#[derive(Deserialize)]
+struct LegacyNestedProject {
+    project: ProjectConfig,
+}
+
+/// Parse a project config from either the new flat shape or the legacy
+/// nested `{"jsn":..,"project":..}` wrapper. Flat is tried first; the nested
+/// form has no top-level `name`, so it only reaches the compat fallback.
+fn parse_project_config(data: &str) -> Option<ProjectConfig> {
+    if let Ok(config) = serde_json::from_str::<ProjectConfig>(data) {
+        return Some(config);
+    }
+    serde_json::from_str::<LegacyNestedProject>(data)
+        .ok()
+        .map(|nested| nested.project)
 }
 
 impl ProjectRoot {
-    pub fn jsn_dir(&self) -> PathBuf {
-        self.root.join(".jsn")
+    /// The `.jackdaw/` directory: gitignored, regenerated build artifacts
+    /// (schema, plan, shim, target) plus local editor state
+    /// (`project.json`) and caches (`registry.json`). Committed project data
+    /// (the manifest, scenes, the asset catalog) lives outside it.
+    pub fn jackdaw_dir(&self) -> PathBuf {
+        self.root.join(".jackdaw")
     }
     pub fn assets_dir(&self) -> PathBuf {
         self.root.join("assets")
@@ -96,54 +149,64 @@ pub fn read_last_project() -> Option<PathBuf> {
     recent.projects.first().map(|e| e.path.clone())
 }
 
-pub fn save_project_config(root: &Path, project: &JsnProject) -> std::io::Result<()> {
-    let jsn_dir = root.join(".jsn");
-    std::fs::create_dir_all(&jsn_dir)?;
-    let path = jsn_dir.join("project.jsn");
-    let data = serde_json::to_string_pretty(project)
+pub fn save_project_config(root: &Path, config: &ProjectConfig) -> std::io::Result<()> {
+    let dir = root.join(".jackdaw");
+    std::fs::create_dir_all(&dir)?;
+    let path = dir.join("project.json");
+    let data = serde_json::to_string_pretty(config)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
     std::fs::write(&path, data)
 }
 
-pub fn load_project_config(root: &Path) -> Option<JsnProject> {
-    // Prefer .jsn/ directory, fall back to legacy root location
-    let new_path = root.join(".jsn/project.jsn");
-    let legacy_path = root.join("project.jsn");
-    let path = if new_path.is_file() {
-        new_path
-    } else {
-        legacy_path
-    };
-    let data = std::fs::read_to_string(path).ok()?;
-    serde_json::from_str(&data).ok()
+pub fn load_project_config(root: &Path) -> Option<ProjectConfig> {
+    // Current location: local editor state under the gitignored `.jackdaw/`.
+    let new_path = root.join(".jackdaw").join("project.json");
+    if new_path.is_file() {
+        return std::fs::read_to_string(&new_path)
+            .ok()
+            .and_then(|data| parse_project_config(&data));
+    }
+    // Legacy locations (newest first). Migrate on read so the next save
+    // writes to `.jackdaw/project.json` and the old file falls out of use.
+    for legacy in [
+        root.join(".jsn").join("project.jsn"),
+        root.join("project.jsn"),
+    ] {
+        if legacy.is_file()
+            && let Ok(data) = std::fs::read_to_string(&legacy)
+            && let Some(config) = parse_project_config(&data)
+        {
+            warn!(
+                "Migrating project config {} -> .jackdaw/project.json",
+                legacy.display()
+            );
+            let _ = save_project_config(root, &config);
+            return Some(config);
+        }
+    }
+    None
 }
 
-pub fn create_default_project(root: &Path) -> JsnProject {
+pub fn create_default_project(root: &Path) -> ProjectConfig {
     let name = root
         .file_name()
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_else(|| "Untitled Project".to_string());
 
-    let project = JsnProject {
-        jsn: JsnHeader::default(),
-        project: JsnProjectConfig {
-            name,
-            description: String::new(),
-            default_scene: None,
-            layout: None,
-            ..Default::default()
-        },
+    let config = ProjectConfig {
+        name,
+        ..Default::default()
     };
 
-    // Write to .jsn/ directory
-    let jsn_dir = root.join(".jsn");
-    let _ = std::fs::create_dir_all(&jsn_dir);
-    let path = jsn_dir.join("project.jsn");
-    if let Ok(data) = serde_json::to_string_pretty(&project) {
+    // Write local editor state under the gitignored `.jackdaw/`.
+    let dir = root.join(".jackdaw");
+    let _ = std::fs::create_dir_all(&dir);
+    let path = dir.join("project.json");
+    if let Ok(data) = serde_json::to_string_pretty(&config) {
         let _ = std::fs::write(&path, data);
     }
 
-    project
+    config
 }
 
 /// Remove a project from the recent projects list.
