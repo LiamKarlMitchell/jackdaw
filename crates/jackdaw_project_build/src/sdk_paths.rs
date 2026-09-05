@@ -334,6 +334,121 @@ impl SdkPaths {
     pub fn wrapper_exists(&self) -> bool {
         self.wrapper.is_file()
     }
+
+    /// The SDK dylib's full metadata, when cargo kept it out of the
+    /// dylib itself (`-Zembed-metadata=no`, the default on recent
+    /// nightlies). The rustc wrapper needs it to redirect `--extern
+    /// bevy=` at the dylib: a stub alone fails the compile with
+    /// `only metadata stub found for dylib dependency bevy`.
+    ///
+    /// Cargo uplifts the dylib but not its `.rmeta`, so the file is not
+    /// beside it; the search covers the uplift dir and the legacy
+    /// `deps/` dir first, then the unit build dir it is actually left
+    /// in. `None` when metadata is embedded, which needs no companion.
+    pub fn dylib_rmeta(&self) -> Option<PathBuf> {
+        let stem = dylib_name().split('.').next().unwrap_or("jackdaw_sdk");
+        let rmeta = format!("lib{}.rmeta", stem.trim_start_matches("lib"));
+        let dylib_dir = self.dylib.parent()?;
+        let direct = [
+            self.dylib.with_extension("rmeta"),
+            dylib_dir.join(&rmeta),
+            self.deps.join(&rmeta),
+        ];
+        if let Some(found) = direct.into_iter().find(|p| p.is_file()) {
+            return Some(found);
+        }
+        // `build/jackdaw_sdk/<hash>/out/`: the hash is not predictable,
+        // and a stale sibling can linger, so take the newest match.
+        let mut candidates: Vec<(std::time::SystemTime, PathBuf)> =
+            unit_out_dirs(dylib_dir, Some("jackdaw_sdk"))
+                .into_iter()
+                .map(|dir| dir.join(&rmeta))
+                .filter_map(|p| {
+                    let modified = std::fs::metadata(&p).ok()?.modified().ok()?;
+                    Some((modified, p))
+                })
+                .collect();
+        candidates.sort_by(|a, b| a.0.cmp(&b.0));
+        candidates.pop().map(|(_, path)| path)
+    }
+
+    /// Directories to hand rustc as `-L dependency=` for target-side
+    /// units, most specific first.
+    ///
+    /// Recent cargo nightlies stopped collecting a build's libraries
+    /// into a single `deps/` dir and give each unit its own
+    /// `build/<pkg>/<hash>/out/`. `-L dependency=` does not recurse, so
+    /// the one path that used to cover the SDK's whole closure now
+    /// covers nothing and every transitive crate has to be listed.
+    /// Layouts that still have `deps/` return just that.
+    pub fn dep_search_dirs(&self) -> Vec<PathBuf> {
+        if self.deps.is_dir() {
+            return vec![self.deps.clone()];
+        }
+        self.dylib
+            .parent()
+            .map(|dir| unit_out_dirs(dir, None))
+            .unwrap_or_default()
+    }
+
+    /// The host-side equivalent of [`dep_search_dirs`](Self::dep_search_dirs),
+    /// holding the proc-macro dylibs SDK rlibs reference as `MacrosOnly`
+    /// dependencies.
+    pub fn host_dep_search_dirs(&self) -> Vec<PathBuf> {
+        if self.host_deps.is_dir() {
+            return vec![self.host_deps.clone()];
+        }
+        self.host_deps
+            .parent()
+            .map(|dir| unit_out_dirs(dir, None))
+            .unwrap_or_default()
+    }
+}
+
+/// Per-unit library dirs under `<profile_dir>/build/<pkg>/<hash>/out/`,
+/// optionally restricted to one package.
+///
+/// The same tree holds build-script `OUT_DIR`s, which hold generated
+/// sources rather than libraries, so dirs with no library in them are
+/// dropped: rustc would only stat its way through them on every crate
+/// load, and the list is already hundreds of entries long.
+fn unit_out_dirs(profile_dir: &std::path::Path, package: Option<&str>) -> Vec<PathBuf> {
+    let Ok(packages) = std::fs::read_dir(profile_dir.join("build")) else {
+        return Vec::new();
+    };
+    let mut dirs = Vec::new();
+    for pkg in packages.flatten() {
+        if package.is_some_and(|want| pkg.file_name() != *want) {
+            continue;
+        }
+        let Ok(hashes) = std::fs::read_dir(pkg.path()) else {
+            continue;
+        };
+        for hash in hashes.flatten() {
+            let out = hash.path().join("out");
+            if package.is_none() && !holds_library(&out) {
+                continue;
+            }
+            if out.is_dir() {
+                dirs.push(out);
+            }
+        }
+    }
+    dirs.sort();
+    dirs
+}
+
+/// Whether a directory holds anything rustc would load as a crate.
+fn holds_library(dir: &std::path::Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return false;
+    };
+    entries.flatten().any(|entry| {
+        matches!(
+            entry.path().extension().and_then(|e| e.to_str()),
+            Some("rlib" | "rmeta" | "so" | "dylib" | "dll")
+        )
+    })
 }
 
 /// Whether a checkout's in-tree SDK is stale enough that the prepared
@@ -594,5 +709,80 @@ mod tests {
                 sdk.dylib.display()
             );
         }
+    }
+
+    /// Stage the layout recent cargo nightlies produce: no `deps/` dir,
+    /// one `build/<pkg>/<hash>/out/` per unit, only final artifacts
+    /// uplifted to the profile dir.
+    fn fake_unit_layout(name: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!("jackdaw_units_{name}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let triple_dir = root.join("target").join(host_triple()).join("release");
+        std::fs::create_dir_all(&triple_dir).unwrap();
+        std::fs::write(triple_dir.join(dylib_name()), b"sdk").unwrap();
+
+        let unit = |pkg: &str, file: &str| {
+            let dir = triple_dir.join("build").join(pkg).join("abc123").join("out");
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join(file), b"x").unwrap();
+            dir
+        };
+        unit("jackdaw_sdk", "libjackdaw_sdk.rmeta");
+        unit("bevy_render", "libbevy_render-dead.rlib");
+        // A build script's OUT_DIR: same tree, generated sources, no
+        // library. Handing it to rustc as a search path is pointless.
+        unit("winit", "bindings.rs");
+        root
+    }
+
+    /// Cargo stopped collecting libraries into `deps/`; the SDK's
+    /// closure now lives one directory per unit and `-L dependency=`
+    /// does not recurse, so every one has to be listed.
+    #[test]
+    fn dep_search_dirs_cover_the_per_unit_layout() {
+        let root = fake_unit_layout("deps");
+        let sdk = SdkPaths::for_workspace_profile(&root, "release");
+        assert!(!sdk.deps.is_dir(), "the staged layout has no deps/ dir");
+
+        let dirs = sdk.dep_search_dirs();
+        let names: Vec<String> = dirs
+            .iter()
+            .filter_map(|d| d.parent()?.parent()?.file_name())
+            .map(|n| n.to_string_lossy().into_owned())
+            .collect();
+        assert!(names.contains(&"bevy_render".to_string()), "got {names:?}");
+        assert!(names.contains(&"jackdaw_sdk".to_string()), "got {names:?}");
+        assert!(
+            !names.contains(&"winit".to_string()),
+            "a build script's OUT_DIR holds no library: {names:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The dylib's own metadata is the one companion that cannot be
+    /// probed for beside the artifact: cargo uplifts the dylib and
+    /// leaves the `.rmeta` in the unit dir.
+    #[test]
+    fn dylib_rmeta_is_found_in_the_unit_build_dir() {
+        let root = fake_unit_layout("rmeta");
+        let sdk = SdkPaths::for_workspace_profile(&root, "release");
+
+        let rmeta = sdk.dylib_rmeta().expect("rmeta in build/jackdaw_sdk/*/out");
+        assert!(rmeta.is_file(), "{}", rmeta.display());
+        assert_eq!(rmeta.file_name().unwrap(), "libjackdaw_sdk.rmeta");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Embedded metadata (older cargo, a shipped bundle) has no
+    /// companion, and the wrapper must be told nothing rather than a
+    /// path that does not resolve.
+    #[test]
+    fn dylib_rmeta_is_absent_when_metadata_is_embedded() {
+        let root = fake_bundle("embedded");
+        let sdk = SdkPaths::for_installed_root(&root);
+        assert!(sdk.dylib_rmeta().is_none());
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

@@ -62,7 +62,11 @@ camera_rig = ["dep:jackdaw_camera_rig"]
 # feature is enabled. Build with CARGO_INCREMENTAL=0: incremental
 # codegen leaves undefined hidden anon constants across the dylib
 # boundary at link time.
-dylib = ["dep:jackdaw_sdk", "jackdaw_api/dynamic_linking", "jackdaw_project_build/reflect"]
+dylib = [
+    "dep:jackdaw_sdk",
+    "jackdaw_api/dynamic_linking",
+    "jackdaw_project_build/reflect",
+]
 # Bake the SDK-builder recipe into the editor binary so a self-contained
 # Cargo install can build its SDK on first launch (the first-run setup
 # screen). Enabled by default; release bundles already carry a built SDK.
@@ -209,6 +213,27 @@ libc = "0.2"
 version = "0.19.0"
 
 [workspace.dependencies]
+# The editor's bevy features, and also the SDK's - the recipe inherits
+# this table verbatim.
+#
+# A project builds against SDK artifacts, so cargo's per-build feature
+# unification makes this list a floor for every project jackdaw hosts:
+# a feature enabled there but missing here yields an artifact compiled
+# without the code the project imports, reported against an unrelated
+# crate. Redirection cannot compensate - it has to apply to a crate
+# everywhere or nowhere.
+#
+# So this is deliberately WIDER than the editor itself needs, covering
+# stock bevy capabilities an ordinary game expects. That is the reason
+# to add one here; a project's own dependencies are never a reason, and
+# per-project features would defeat the point of a prebuilt SDK shared
+# across projects. `write_plan` names any remaining shortfall.
+#
+# `system_clipboard`: without it `bevy_clipboard` silently degrades to
+# an in-process String buffer - same API, compiles fine, but no
+# exchange with other processes. Under PIE the game runs in a child
+# process, so this covers editor-to-game as well as external apps.
+# `free_camera`: stock bevy camera controller.
 bevy = { version = "0.19", features = [
     "bevy_feathers",
     "bevy_scene",
@@ -218,6 +243,8 @@ bevy = { version = "0.19", features = [
     "bevy_remote",
     "file_watcher",
     "reflect_documentation",
+    "system_clipboard",
+    "free_camera",
 ] }
 jackdaw_jsn = { version = "0.19.0", path = "crates/jackdaw_jsn" }
 jackdaw_geometry = { version = "0.19.0", path = "crates/jackdaw_geometry" }
@@ -354,6 +381,7 @@ workspace = true
 
 [profile.dev]
 opt-level = 1
+debug = "line-tables-only"
 
 [profile.dev.package."*"]
 opt-level = 3

@@ -288,6 +288,20 @@ pub fn build_project_dylib(
         }
     }
 
+    // Pin drifted closure crates back to the SDK's versions before
+    // planning. Seeding the lock above is not sufficient on its own:
+    // cargo re-resolves over the seed and moves packages whose
+    // dependency edges differ, and a crate that drifts stops matching
+    // the manifest, so it silently loses its redirect while its
+    // redirected neighbours keep theirs.
+    match plan::align_lock(&shim_dir, &manifest) {
+        Ok(0) => {}
+        Ok(pinned) => tracing::info!("aligned {pinned} crate(s) to the SDK's versions"),
+        // Planning against a drifted lock still builds for most
+        // projects, so a failure here is reported and not fatal.
+        Err(e) => tracing::warn!("could not align the project lockfile to the SDK: {e}"),
+    }
+
     let plan_path = jackdaw_dir.join("plan.txt");
     let edges = plan::write_plan(&shim_dir, &manifest, &sdk.deps, &plan_path)?;
 
@@ -338,6 +352,28 @@ pub fn build_project_dylib(
         .env("JACKDAW_SDK_DEPS", &sdk.deps)
         .env("JACKDAW_SDK_HOST_DEPS", &sdk.host_deps)
         .env("JACKDAW_SDK_EXTERN_MAP", &plan_path);
+    // Recent cargo nightlies give every unit its own
+    // `build/<pkg>/<hash>/out/` instead of one `deps/` dir, so the two
+    // paths above resolve to nothing and rustc has to be handed the
+    // whole list. Empty on layouts that still have `deps/`.
+    let mut search_dirs = sdk.dep_search_dirs();
+    search_dirs.extend(sdk.host_dep_search_dirs());
+    search_dirs.retain(|dir| dir != &sdk.deps && dir != &sdk.host_deps);
+    if !search_dirs.is_empty()
+        && let Ok(joined) = std::env::join_paths(&search_dirs)
+    {
+        cmd.env("JACKDAW_SDK_DEP_DIRS", joined);
+    }
+    // Native search paths the SDK's build scripts emitted. A redirected
+    // rlib's `#[link]` requirement can name an import library that only
+    // exists in a crate version the project's own graph never resolves,
+    // so nothing project-side emits the path and the link fails naming
+    // just the missing file. Recorded beside the manifest; empty for an
+    // SDK built before they were captured.
+    let link_paths = plan::read_link_paths(&sdk.manifest);
+    if !link_paths.is_empty() {
+        cmd.env("JACKDAW_SDK_LINK_PATHS", link_paths.join("\n"));
+    }
     match static_rlibs {
         Some((bevy_rlib, api_rlib)) => {
             cmd.env("JACKDAW_SDK_STATIC", "1")
@@ -346,6 +382,11 @@ pub fn build_project_dylib(
         }
         None => {
             cmd.env("JACKDAW_SDK_DYLIB", &sdk.dylib);
+            // Only set when cargo left the dylib's metadata out of it;
+            // the wrapper treats an absent var as "metadata embedded".
+            if let Some(rmeta) = sdk.dylib_rmeta() {
+                cmd.env("JACKDAW_SDK_DYLIB_RMETA", rmeta);
+            }
         }
     }
     let mut child = cmd

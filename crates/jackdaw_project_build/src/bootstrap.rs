@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 /// The rustup toolchain the SDK is pinned to. Must match the embedded
 /// recipe's `rust-toolchain.toml`: the rmeta trick requires project
 /// builds and the SDK to share an exact rustc.
-pub const SDK_TOOLCHAIN_CHANNEL: &str = "nightly-2026-03-05";
+pub const SDK_TOOLCHAIN_CHANNEL: &str = "nightly-2026-08-25";
 
 /// The jackdaw data dir: `$XDG_DATA_HOME/jackdaw` when set to an absolute
 /// path, else `~/.jackdaw`. `None` when no home directory resolves.

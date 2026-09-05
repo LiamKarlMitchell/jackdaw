@@ -48,23 +48,43 @@
 //!
 //! # Env vars the wrapper reads
 //!
-//! | Var                      | Required       | Purpose                              |
-//! |--------------------------|----------------|--------------------------------------|
-//! | `JACKDAW_SDK_DYLIB`      | yes            | Absolute path to `libjackdaw_sdk.so` |
-//! | `JACKDAW_SDK_DEPS`       | yes            | Absolute path to the `deps/` dir     |
-//! | `JACKDAW_SDK_HOST_DEPS`  | no             | Host deps dir (proc-macro dylibs)    |
-//! | `JACKDAW_SDK_EXTERN_MAP` | no             | Path to the per-edge redirect plan   |
-//! | `JACKDAW_WRAPPER_LOG`    | no             | If `1`, log rewrites to stderr       |
-//! | `CARGO_PRIMARY_PACKAGE`  | (set by cargo) | `1` while compiling the user crate   |
-//! | `CARGO_PKG_NAME`         | (set by cargo) | Consumer key for plan edge lookups   |
+//! | Var                       | Required       | Purpose                              |
+//! |---------------------------|----------------|--------------------------------------|
+//! | `JACKDAW_SDK_DYLIB`       | yes            | Absolute path to `libjackdaw_sdk.so` |
+//! | `JACKDAW_SDK_DEPS`        | yes            | Absolute path to the `deps/` dir     |
+//! | `JACKDAW_SDK_DYLIB_RMETA` | no             | Full metadata for the SDK dylib      |
+//! | `JACKDAW_SDK_DEP_DIRS`    | no             | Extra `-L dependency=` dirs (joined) |
+//! | `JACKDAW_SDK_LINK_PATHS`  | no             | SDK build-script `-L` dirs (per line) |
+//! | `JACKDAW_SDK_HOST_DEPS`   | no             | Host deps dir (proc-macro dylibs)    |
+//! | `JACKDAW_SDK_EXTERN_MAP`  | no             | Path to the per-edge redirect plan   |
+//! | `JACKDAW_WRAPPER_LOG`     | no             | If `1`, log rewrites to stderr       |
+//! | `CARGO_PRIMARY_PACKAGE`   | (set by cargo) | `1` while compiling the user crate   |
+//! | `CARGO_PKG_NAME`          | (set by cargo) | Consumer key for plan edge lookups   |
+//!
+//! # Metadata companions
+//!
+//! Cargo on recent nightlies defaults to `-Zembed-metadata=no`: an
+//! `.rlib` or dylib carries only a metadata *stub*, and the full
+//! metadata lives in a sibling `.rmeta`. Cargo compensates by emitting
+//! `--extern <alias>=` **twice** per dependency, once for the link
+//! artifact and once for the `.rmeta`. Redirecting only ever produced
+//! one path, which collapsed both halves of that pair onto a stub and
+//! failed the compile with
+//! `only metadata stub found for dylib dependency ...`. Every redirect
+//! therefore emits its `.rmeta` companion too, when one exists; where
+//! metadata is still embedded there is no companion and nothing changes.
 
 use std::env;
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
+use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 use tracing::error;
 
 const ENV_SDK_DYLIB: &str = "JACKDAW_SDK_DYLIB";
+const ENV_SDK_DYLIB_RMETA: &str = "JACKDAW_SDK_DYLIB_RMETA";
 const ENV_SDK_DEPS: &str = "JACKDAW_SDK_DEPS";
+const ENV_SDK_DEP_DIRS: &str = "JACKDAW_SDK_DEP_DIRS";
+const ENV_SDK_LINK_PATHS: &str = "JACKDAW_SDK_LINK_PATHS";
 const ENV_SDK_HOST_DEPS: &str = "JACKDAW_SDK_HOST_DEPS";
 const ENV_PRIMARY_PACKAGE: &str = "CARGO_PRIMARY_PACKAGE";
 const ENV_LOG: &str = "JACKDAW_WRAPPER_LOG";
@@ -110,7 +130,16 @@ pub fn run() -> ExitCode {
         return ExitCode::from(1);
     }
     let rustc = argv.remove(1);
-    let mut rustc_args: Vec<OsString> = argv.split_off(1);
+    // Cargo has its own response-file mechanism, independent of rustc's: when
+    // cargo's own invocation of us would be too long, it collapses it to a
+    // single `@cargo-argfile.XXXXXX` token before ever calling this wrapper.
+    // Expand that ourselves rather than writing the literal "@path" string
+    // into our own outgoing argfile and hoping rustc's nested-argfile
+    // expansion resolves it - relying on that indirection both crashed (the
+    // nested open failed) and silently broke the SDK redirects below, which
+    // never saw `--target`/`--extern` because they were hidden inside
+    // cargo's file.
+    let mut rustc_args: Vec<OsString> = expand_argfiles(argv.split_off(1));
 
     let is_primary = env::var_os(ENV_PRIMARY_PACKAGE).is_some_and(|v| v == "1");
     let log = env::var_os(ENV_LOG).is_some_and(|v| v == "1");
@@ -124,7 +153,37 @@ pub fn run() -> ExitCode {
         return ExitCode::from(1);
     }
 
-    let status = Command::new(&rustc).args(&rustc_args).status();
+    // Always route through an rustc @argfile rather than the raw command
+    // line. Windows' ~32KB CreateProcess limit is far below what a large
+    // bevy + jackdaw dependency graph's `-L`/`--extern` flags produce (see
+    // docs/jackdaw-improvements.md, "filename or extension too long"); other
+    // platforms have a much higher ARG_MAX but pay only a negligible extra
+    // temp-file write per rustc invocation, so one code path for every OS
+    // beats maintaining a length-threshold branch that could still be wrong.
+    let argfile_path = env::temp_dir().join(format!(
+        "jackdaw-rustc-wrapper-{}-{}.args",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    let argfile_contents = rustc_args
+        .iter()
+        .map(|a| a.to_string_lossy().into_owned())
+        .collect::<Vec<_>>()
+        .join("\n");
+    if let Err(e) = std::fs::write(&argfile_path, argfile_contents) {
+        error!(
+            "jackdaw-rustc-wrapper: failed to write argfile {argfile_path:?}: {e}"
+        );
+        return ExitCode::from(1);
+    }
+
+    let mut argfile_arg = OsString::from("@");
+    argfile_arg.push(&argfile_path);
+    let status = Command::new(&rustc).arg(argfile_arg).status();
+    let _ = std::fs::remove_file(&argfile_path);
 
     match status {
         Ok(s) => ExitCode::from(s.code().unwrap_or(1) as u8),
@@ -133,6 +192,32 @@ pub fn run() -> ExitCode {
             ExitCode::from(1)
         }
     }
+}
+
+/// Recursively expand any `@path` argument into the lines of that file, one
+/// arg per line (rustc/cargo's shared, unquoted response-file format - see
+/// `-Zshell-argfiles` in `rustc -Z help` for the opt-in quoted alternative,
+/// which neither side uses here). Handles both rustc's own `@file` and
+/// cargo's independent pre-collapse of an overlong invocation into
+/// `@cargo-argfile.XXXXXX` before it ever reaches this wrapper.
+fn expand_argfiles(args: Vec<OsString>) -> Vec<OsString> {
+    let mut out = Vec::with_capacity(args.len());
+    for arg in args {
+        match arg.to_str().and_then(|s| s.strip_prefix('@')) {
+            Some(path) => match std::fs::read_to_string(path) {
+                Ok(contents) => {
+                    let lines: Vec<OsString> = contents.lines().map(OsString::from).collect();
+                    out.extend(expand_argfiles(lines));
+                }
+                Err(e) => {
+                    error!("jackdaw-rustc-wrapper: failed to expand argfile {path}: {e}");
+                    out.push(arg);
+                }
+            },
+            None => out.push(arg),
+        }
+    }
+    out
 }
 
 /// Rewrite one rustc invocation. The `bevy` facade extern redirects to
@@ -190,34 +275,68 @@ fn rewrite_args(argv: &mut Vec<OsString>, is_primary: bool, log: bool) -> Result
         _ => String::new(),
     };
 
+    // The SDK dylib's own full metadata. It is not a sibling of the
+    // uplifted dylib (cargo leaves it in the unit's build dir), so it
+    // cannot be probed for and has to be passed in.
+    let dylib_rmeta = env::var_os(ENV_SDK_DYLIB_RMETA).filter(|p| Path::new(p).is_file());
+
+    // Rebuild the `--extern` flags rather than editing in place. Cargo
+    // emits a pair per dependency under `-Zembed-metadata=no`, and both
+    // halves rewrite to the same artifact, so the pass has to drop the
+    // resulting duplicate and append the redirect's own `.rmeta`
+    // companion in its place.
     let mut redirected = false;
+    let mut seen: Vec<OsString> = Vec::new();
+    let mut companions: Vec<OsString> = Vec::new();
+    let mut out: Vec<OsString> = Vec::with_capacity(argv.len());
     let mut i = 0;
     while i < argv.len() {
         if argv[i] == "--extern" && i + 1 < argv.len() {
-            if let Some(new_value) =
-                rewrite_extern(&argv[i + 1], &bevy_target, &extern_map, &consumer)
-            {
-                if log {
-                    error!(
-                        "jackdaw-rustc-wrapper: rewrite --extern {:?} -> {:?}",
-                        argv[i + 1],
-                        new_value
-                    );
+            let value = match rewrite_extern(&argv[i + 1], &bevy_target, &extern_map, &consumer) {
+                Some(new_value) => {
+                    if log {
+                        error!(
+                            "jackdaw-rustc-wrapper: rewrite --extern {:?} -> {:?}",
+                            argv[i + 1], new_value
+                        );
+                    }
+                    redirected = true;
+                    if let Some(rmeta) =
+                        metadata_companion(&new_value, &bevy_target, dylib_rmeta.as_ref())
+                        && !companions.contains(&rmeta)
+                    {
+                        if log {
+                            error!("jackdaw-rustc-wrapper: metadata companion {rmeta:?}");
+                        }
+                        companions.push(rmeta);
+                    }
+                    new_value
                 }
-                argv[i + 1] = new_value;
-                redirected = true;
+                None => argv[i + 1].clone(),
+            };
+            if !seen.contains(&value) {
+                seen.push(value.clone());
+                out.push(OsString::from("--extern"));
+                out.push(value);
             }
             i += 2;
             continue;
         }
+        out.push(argv[i].clone());
         i += 1;
     }
+    for companion in companions {
+        out.push(OsString::from("--extern"));
+        out.push(companion);
+    }
+    *argv = out;
 
     if is_primary {
         for alias in INJECTED_CRATES {
             let mut flag = OsString::from(alias);
             flag.push("=");
             flag.push(&api_target);
+            let companion = metadata_companion(&flag, &bevy_target, dylib_rmeta.as_ref());
             argv.push(OsString::from("--extern"));
             argv.push(flag);
             if log {
@@ -226,6 +345,10 @@ fn rewrite_args(argv: &mut Vec<OsString>, is_primary: bool, log: bool) -> Result
                     alias,
                     api_target.to_string_lossy()
                 );
+            }
+            if let Some(companion) = companion {
+                argv.push(OsString::from("--extern"));
+                argv.push(companion);
             }
         }
     }
@@ -247,6 +370,44 @@ fn rewrite_args(argv: &mut Vec<OsString>, is_primary: bool, log: bool) -> Result
         host_flag.push(&host_deps);
         argv.push(OsString::from("-L"));
         argv.push(host_flag);
+    }
+    // Recent cargo nightlies no longer collect a build's libraries into
+    // one `deps/` dir; each unit gets its own
+    // `build/<pkg>/<hash>/out/`. `-L dependency=` does not recurse, so
+    // one path can no longer cover the SDK's closure and the driver
+    // passes the whole list. Absent (older cargo, shipped SDK) the two
+    // paths above still cover it.
+    if let Some(dep_dirs) = env::var_os(ENV_SDK_DEP_DIRS) {
+        for dir in env::split_paths(&dep_dirs) {
+            let mut flag = OsString::from("dependency=");
+            flag.push(dir);
+            argv.push(OsString::from("-L"));
+            argv.push(flag);
+        }
+    }
+    // Native search paths from the SDK's build scripts. A redirected
+    // rlib can require an import library the project's own graph never
+    // builds a path to - the SDK's `windows_x86_64_msvc 0.42.2` ships
+    // the plain `windows.lib`, while a project on 0.52/0.60 has only
+    // `windows.0.52.0.lib` - and the link then fails naming the file
+    // and no crate. Newline-separated, since each entry already carries
+    // cargo's `KIND=PATH` form and a path list separator would clash
+    // with the `=` and with Windows drive letters.
+    if let Some(link_paths) = env::var_os(ENV_SDK_LINK_PATHS)
+        && let Some(link_paths) = link_paths.to_str()
+    {
+        for entry in link_paths.lines().filter(|l| !l.trim().is_empty()) {
+            // Cargo emits `native=/path`; pass a bare path through as
+            // `native=` since that is what a build script's
+            // `rustc-link-search` defaults to.
+            let flag = if entry.contains('=') {
+                entry.to_string()
+            } else {
+                format!("native={entry}")
+            };
+            argv.push(OsString::from("-L"));
+            argv.push(OsString::from(flag));
+        }
     }
 
     // `-C prefer-dynamic` links through the SDK dll. In the static model
@@ -336,4 +497,136 @@ fn rewrite_extern(
     out.push("=");
     out.push(artifact);
     Some(out)
+}
+
+/// The `<alias>=<path>.rmeta` companion for a rewritten `--extern`
+/// value, or `None` when the artifact already carries its metadata.
+///
+/// Under `-Zembed-metadata=no` a library holds a stub and the real
+/// metadata sits in a `.rmeta`. For a plan artifact
+/// (`.../out/libbevy_render-<hash>.rlib`) that file is its sibling. The
+/// SDK dylib is the exception: cargo uplifts it to the profile dir and
+/// leaves its `.rmeta` behind in the unit's build dir, so the driver
+/// passes that path in `$JACKDAW_SDK_DYLIB_RMETA` and it is used for
+/// any redirect pointing at the dylib.
+fn metadata_companion(
+    value: &OsStr,
+    dylib_target: &OsStr,
+    dylib_rmeta: Option<&OsString>,
+) -> Option<OsString> {
+    let s = value.to_str()?;
+    let (alias, path) = s.split_once('=')?;
+    let path = Path::new(path);
+    if path.extension().is_some_and(|ext| ext == "rmeta") {
+        return None;
+    }
+    let rmeta = match dylib_rmeta {
+        // The dylib case only; the static model redirects to rlibs,
+        // whose companions sit beside them like any other unit's.
+        Some(rmeta) if path == Path::new(dylib_target) => PathBuf::from(rmeta),
+        _ => {
+            let sibling = path.with_extension("rmeta");
+            if !sibling.is_file() {
+                return None;
+            }
+            sibling
+        }
+    };
+    let mut out = OsString::from(alias);
+    out.push("=");
+    out.push(rmeta);
+    Some(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn scratch(name: &str) -> PathBuf {
+        let dir = env::temp_dir().join(format!(
+            "jackdaw_wrapper_{name}_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn extern_value(alias: &str, path: &Path) -> OsString {
+        let mut v = OsString::from(alias);
+        v.push("=");
+        v.push(path);
+        v
+    }
+
+    /// Under `-Zembed-metadata=no` a plan artifact is a stub whose real
+    /// metadata is the `.rmeta` beside it. Redirecting to the stub alone
+    /// is what produces `only metadata stub found for dylib dependency`.
+    #[test]
+    fn a_plan_artifact_takes_its_sibling_rmeta() {
+        let dir = scratch("sibling");
+        let rlib = dir.join("libbevy_render-abc.rlib");
+        std::fs::write(&rlib, b"stub").unwrap();
+        std::fs::write(dir.join("libbevy_render-abc.rmeta"), b"meta").unwrap();
+
+        let got = metadata_companion(&extern_value("bevy_render", &rlib), OsStr::new(""), None);
+        assert_eq!(
+            got,
+            Some(extern_value(
+                "bevy_render",
+                &dir.join("libbevy_render-abc.rmeta")
+            ))
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Embedded metadata (older cargo, a shipped SDK) has no companion,
+    /// and inventing one would hand rustc a path that does not resolve.
+    #[test]
+    fn an_embedded_artifact_has_no_companion() {
+        let dir = scratch("embedded");
+        let rlib = dir.join("libglam-abc.rlib");
+        std::fs::write(&rlib, b"whole").unwrap();
+
+        assert_eq!(
+            metadata_companion(&extern_value("glam", &rlib), OsStr::new(""), None),
+            None
+        );
+        // Cargo's own `.rmeta` half of the pair is already metadata.
+        let rmeta = dir.join("libglam-abc.rmeta");
+        std::fs::write(&rmeta, b"meta").unwrap();
+        assert_eq!(
+            metadata_companion(&extern_value("glam", &rmeta), OsStr::new(""), None),
+            None
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The SDK dylib is the one artifact whose `.rmeta` is not beside
+    /// it - cargo uplifts the dylib and leaves the metadata in the unit
+    /// build dir - so the path has to be passed in.
+    #[test]
+    fn the_dylib_takes_the_path_it_is_given() {
+        let dir = scratch("dylib");
+        let dylib = dir.join("jackdaw_sdk.dll");
+        std::fs::write(&dylib, b"stub").unwrap();
+        let rmeta = dir.join("build/jackdaw_sdk/abc/out/libjackdaw_sdk.rmeta");
+        std::fs::create_dir_all(rmeta.parent().unwrap()).unwrap();
+        std::fs::write(&rmeta, b"meta").unwrap();
+        let rmeta_env = OsString::from(&rmeta);
+
+        let got = metadata_companion(
+            &extern_value("bevy", &dylib),
+            dylib.as_os_str(),
+            Some(&rmeta_env),
+        );
+        assert_eq!(got, Some(extern_value("bevy", &rmeta)));
+
+        // Without it there is nothing beside the dylib to fall back to.
+        assert_eq!(
+            metadata_companion(&extern_value("bevy", &dylib), dylib.as_os_str(), None),
+            None
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

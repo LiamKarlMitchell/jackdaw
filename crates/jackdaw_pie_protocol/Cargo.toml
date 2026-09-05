@@ -14,7 +14,7 @@ ipc = ["dep:ipc-channel"]
 bevy = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
-ipc-channel = { version = "0.22", optional = true }
+ipc-channel = { version = "0.23", optional = true }
 
 [dev-dependencies]
 toml = "0.8"

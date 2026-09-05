@@ -1,0 +1,15 @@
+bevy_ecs::hierarchy::Children [
+    #base_mesh
+    bevy_pbr::pbr_material::StandardMaterial {
+        occlusion_texture: "jan\\base_mesh_ao.png",
+        parallax_depth_scale: 0.0,
+        max_parallax_layer_count: 0.0,
+    }
+    ,
+    #basemesh_male_m
+    bevy_pbr::pbr_material::StandardMaterial {
+        base_color_texture: "jan\\BaseMesh_Male_M_BaseColor.png",
+        parallax_depth_scale: 0.0,
+        max_parallax_layer_count: 0.0,
+    }
+]
