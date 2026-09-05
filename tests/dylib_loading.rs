@@ -21,7 +21,8 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use bevy::prelude::*;
+use bevy_ecs::prelude::*;
+use bevy_app::prelude::*;
 use jackdaw_api_internal::lifecycle::ExtensionCatalog;
 use jackdaw_loader::{LoadError, LoadedDylibs, load_from_path};
 

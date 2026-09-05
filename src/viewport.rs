@@ -14,7 +14,7 @@ use jackdaw_api::prelude::*;
 use jackdaw_api_internal::keymap::PresetInput;
 use jackdaw_camera::{JackdawCameraPlugin, JackdawCameraSettings};
 
-use bevy::ecs::system::SystemParam;
+use bevy_ecs::system::SystemParam;
 
 use crate::core_extension::CoreExtensionInputContext;
 use crate::selection::{Selected, Selection};
@@ -750,7 +750,7 @@ fn update_active_viewport(
     mut active: ResMut<ActiveViewport>,
     mut camera_query: Query<(Entity, &mut JackdawCameraSettings)>,
     modal: Res<crate::modal_transform::ModalTransformState>,
-    input_focus: Res<bevy::input_focus::InputFocus>,
+    input_focus: Res<bevy_input_focus::InputFocus>,
     blockers: Query<(), With<crate::BlocksCameraInput>>,
     mouse: Res<ButtonInput<MouseButton>>,
     mut fly_state: ResMut<CameraFlyActive>,

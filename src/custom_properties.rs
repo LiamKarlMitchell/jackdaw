@@ -1,4 +1,5 @@
-use bevy::prelude::*;
+use bevy_ecs::prelude::*;
+use bevy_app::prelude::*;
 
 // Re-export types from jackdaw_scene_types.
 pub use jackdaw_scene_types::{CustomProperties, PropertyValue};
