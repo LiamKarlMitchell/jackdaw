@@ -44,9 +44,11 @@ impl Plugin for JackdawPlugin {
         // Registers every scene type for reflection and installs
         // `MeshRebuildPlugin` (which embeds the bundled grid texture
         // used as the brush fallback material).
-        app.add_plugins(jackdaw_scene_types::SceneTypesPlugin {
-            runtime_mesh_rebuild: true,
-        });
+        if !app.is_plugin_added::<jackdaw_scene_types::SceneTypesPlugin>() {
+            app.add_plugins(jackdaw_scene_types::SceneTypesPlugin {
+                runtime_mesh_rebuild: true,
+            });
+        }
         app.add_plugins(jackdaw_ui::JackdawUiPlugin::default());
 
         app.init_asset::<JackdawScene>()

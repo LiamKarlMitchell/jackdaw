@@ -289,8 +289,12 @@ impl Plugin for EditorCorePlugin {
             "EditorCorePlugin requires EnhancedInputPlugin first; \
              add `EnhancedInputPlugin` in main.rs before JackdawEditorPlugins."
         );
-        app.init_state::<AppState>()
-            .add_plugins((FeathersPlugins, EditorFeathersPlugin));
+        app.init_state::<AppState>();
+        // Check plugin from `FeathersPlugin` group is not already loaded.
+        if !app.is_plugin_added::<bevy::input_focus::tab_navigation::TabNavigationPlugin>() {
+            app.add_plugins(FeathersPlugins);
+        }
+        app.add_plugins(EditorFeathersPlugin);
         app.add_plugins((
             jackdaw_ui::JackdawUiPlugin::marked_only(),
             ui_projection::UiProjectionPlugin,
